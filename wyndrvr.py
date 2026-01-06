@@ -4,6 +4,17 @@ wyndrvr - Latency and Bandwidth Utility
 A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
+__version__ = "0.1"
+__version_notes__ = """
+Version 0.1:
+- Implemented heartbeat exchange protocol with timestamp handling
+- Client initiates heartbeat, server echoes, client sends final echo
+- Both client and server calculate and report latency to stderr
+- Heartbeat rate changed to milliseconds (default 5000ms)
+- Fixed byte length validation for heartbeat messages
+- Added immediate first heartbeat on client connection
+"""
+
 import argparse
 import socket
 import sys
@@ -12,9 +23,10 @@ import threading
 import multiprocessing
 import time
 import select
+import struct
 from pathlib import Path
 from enum import Enum
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 
 
@@ -37,7 +49,7 @@ class ServerConfig:
     incoming_sleep: int = 0  # microseconds
     max_send_time: int = 0  # microseconds
     send_sleep: int = 0  # microseconds
-    heartbeat_rate: int = 1000000  # microseconds (1 second)
+    heartbeat_rate: int = 5000  # milliseconds (5 seconds)
     adjustment_delay: int = 1000000  # microseconds (1 second)
     flow_control_rate: int = 10  # divider for adjustment_delay
     
@@ -91,6 +103,7 @@ class WyndServer:
         self.running = False
         self.main_socket = None
         self.client_connections = {}  # client_addr -> (control_port, upload_port, download_port)
+        self.client_sockets = {}  # port -> socket for client connections
     
     def load_config(self, config_path: Path) -> ServerConfig:
         """Load configuration from file"""
@@ -184,7 +197,26 @@ class WyndServer:
                 time.sleep(self.config.incoming_sleep / 1_000_000)
     
     def handle_client_connection(self, client_addr: Tuple[str, int], data: bytes):
-        """Handle new client connection"""
+        """Handle new client connection and heartbeat messages"""
+        # Check if this is a heartbeat message
+        if data.startswith(b"HEARTBEAT:"):
+            # Extract timestamp and echo back with server timestamp
+            client_timestamp = struct.unpack('d', data[10:])[0]
+            server_time = time.time()
+            
+            # Calculate server-side latency (half round-trip from previous exchange)
+            response = b"HEARTBEAT_ECHO:" + struct.pack('dd', client_timestamp, server_time)
+            self.main_socket.sendto(response, client_addr)
+            return
+        
+        if data.startswith(b"HEARTBEAT_FINAL:"):
+            # Final echo from client - calculate latency
+            client_timestamp, server_timestamp = struct.unpack('dd', data[16:])
+            current_time = time.time()
+            latency = (current_time - server_timestamp) * 1000  # Convert to milliseconds
+            print(f"Server latency to {client_addr[0]}:{client_addr[1]}: {latency:.2f} ms", file=sys.stderr)
+            return
+        
         if client_addr not in self.client_connections:
             # Allocate three ports for this client
             ports = self.port_manager.allocate_ports(3)
@@ -200,17 +232,31 @@ class WyndServer:
             print(f"  Control Port: {control_port}")
             print(f"  Upload Port: {upload_port}")
             print(f"  Download Port: {download_port}")
+            
+            # Create sockets for this client's ports
+            self.setup_client_sockets(control_port, upload_port, download_port)
         
         # Send port information back to client
         ports = self.client_connections[client_addr]
         response = f"{ports[0]},{ports[1]},{ports[2]}".encode()
         self.main_socket.sendto(response, client_addr)
     
+    def setup_client_sockets(self, control_port: int, upload_port: int, download_port: int):
+        """Setup sockets for client ports"""
+        for port in [control_port, upload_port, download_port]:
+            if port not in self.client_sockets:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind((self.config.bind_addr, port))
+                sock.setblocking(False)
+                self.client_sockets[port] = sock
+    
     def stop(self):
         """Stop the server"""
         self.running = False
         if self.main_socket:
             self.main_socket.close()
+        for sock in self.client_sockets.values():
+            sock.close()
 
 
 class WyndClient:
@@ -224,6 +270,8 @@ class WyndClient:
         self.upload_socket = None
         self.download_socket = None
         self.running = False
+        self.heartbeat_interval = 5.0  # seconds
+        self.last_heartbeat = 0
     
     def start(self):
         """Start the client and connect to server"""
@@ -261,10 +309,56 @@ class WyndClient:
             
             print("Client connected successfully")
             
+            # Initialize heartbeat timing and send first heartbeat
+            self.last_heartbeat = time.time()
+            self.send_heartbeat()
+            
+            # Start heartbeat thread
+            self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
+            self.heartbeat_thread.start()
+            
         except socket.timeout:
             print("Timeout waiting for server response", file=sys.stderr)
         except Exception as e:
             print(f"Error connecting to server: {e}", file=sys.stderr)
+    
+    def heartbeat_loop(self):
+        """Send periodic heartbeats and measure latency"""
+        self.main_socket.setblocking(False)
+        
+        while self.running:
+            current_time = time.time()
+            
+            if current_time - self.last_heartbeat >= self.heartbeat_interval:
+                self.send_heartbeat()
+                self.last_heartbeat = current_time
+            
+            # Check for heartbeat responses
+            try:
+                data, _ = self.main_socket.recvfrom(4096)
+                if data.startswith(b"HEARTBEAT_ECHO:") and len(data) >= 31:
+                    client_timestamp, server_timestamp = struct.unpack('dd', data[15:])
+                    current_time = time.time()
+                    
+                    # Calculate round-trip latency
+                    latency = (current_time - client_timestamp) * 1000  # milliseconds
+                    print(f"Client latency: {latency:.2f} ms", file=sys.stderr)
+                    
+                    # Send final echo back to server
+                    final_echo = b"HEARTBEAT_FINAL:" + struct.pack('dd', client_timestamp, server_timestamp)
+                    self.main_socket.sendto(final_echo, (self.server_addr, self.server_port))
+            except BlockingIOError:
+                pass
+            except Exception as e:
+                print(f"Error in heartbeat loop: {e}", file=sys.stderr)
+            
+            time.sleep(0.1)  # Small sleep to avoid busy waiting
+    
+    def send_heartbeat(self):
+        """Send heartbeat with timestamp to server"""
+        timestamp = time.time()
+        message = b"HEARTBEAT:" + struct.pack('d', timestamp)
+        self.main_socket.sendto(message, (self.server_addr, self.server_port))
     
     def stop(self):
         """Stop the client"""
