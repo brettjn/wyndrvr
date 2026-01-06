@@ -1,0 +1,30 @@
+# wyndrvr configuration file
+# All time values: microseconds (unless specified otherwise)
+
+# Server bind settings
+bind_addr=0.0.0.0
+bind_port=6711
+
+# Port ranges for client connections (format: start-end,start-end)
+port_ranges=7000-8000
+
+# Parallelization modes: SINGLE, THREAD, PROCESS
+connection_parallelibility=SINGLE
+port_parallelability=SINGLE
+
+# Incoming packet handling
+incoming_blocking_level=0
+incoming_sleep=0
+
+# Outgoing packet handling
+max_send_time=0
+send_sleep=0
+
+# Heartbeat and flow control (milliseconds for heartbeat_rate)
+heartbeat_rate=5000
+adjustment_delay=1000000
+flow_control_rate=10
+
+# Socket blocking times (milliseconds)
+server_block_time=100
+client_block_time=100

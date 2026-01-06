@@ -4,8 +4,14 @@ wyndrvr - Latency and Bandwidth Utility
 A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
-__version__ = "0.3"
+__version__ = "0.4"
 __version_notes__ = """
+Version 0.4:
+- Added command line arguments for all config settings (--bind-addr, --bind-port, etc.)
+- Config file creation/editing with command line arguments
+- Warning when editing existing config files with list of changes
+- All timing and parallelization settings configurable via CLI
+
 Version 0.3:
 - Added --config option to specify custom config file location
 - Added --create-config option to generate default config file
@@ -225,6 +231,179 @@ client_block_time=100
             print(f"Error creating config file: {e}", file=sys.stderr)
             return False
     
+    def update_config_from_args(self, config_path: Path, args) -> bool:
+        """Update existing config file or create new one with values from command line args"""
+        is_new = not config_path.exists()
+        
+        # Start with default config
+        if is_new:
+            config_dict = {
+                'bind_addr': '0.0.0.0',
+                'bind_port': '6711',
+                'port_ranges': '7000-8000',
+                'connection_parallelibility': 'SINGLE',
+                'port_parallelability': 'SINGLE',
+                'incoming_blocking_level': '0',
+                'incoming_sleep': '0',
+                'max_send_time': '0',
+                'send_sleep': '0',
+                'heartbeat_rate': '5000',
+                'adjustment_delay': '1000000',
+                'flow_control_rate': '10',
+                'server_block_time': '100',
+                'client_block_time': '100'
+            }
+        else:
+            # Load existing config
+            config_dict = {}
+            with open(config_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        config_dict[key.strip()] = value.strip()
+        
+        # Track changes
+        changes = []
+        
+        # Update with command line arguments
+        if args.bind_addr is not None:
+            old_val = config_dict.get('bind_addr')
+            config_dict['bind_addr'] = args.bind_addr
+            if not is_new and old_val != args.bind_addr:
+                changes.append(f"bind_addr: {old_val} -> {args.bind_addr}")
+        
+        if args.bind_port is not None:
+            old_val = config_dict.get('bind_port')
+            config_dict['bind_port'] = str(args.bind_port)
+            if not is_new and old_val != str(args.bind_port):
+                changes.append(f"bind_port: {old_val} -> {args.bind_port}")
+        
+        if args.port_ranges is not None:
+            old_val = config_dict.get('port_ranges')
+            config_dict['port_ranges'] = args.port_ranges
+            if not is_new and old_val != args.port_ranges:
+                changes.append(f"port_ranges: {old_val} -> {args.port_ranges}")
+        
+        if args.connection_parallelibility is not None:
+            old_val = config_dict.get('connection_parallelibility')
+            config_dict['connection_parallelibility'] = args.connection_parallelibility
+            if not is_new and old_val != args.connection_parallelibility:
+                changes.append(f"connection_parallelibility: {old_val} -> {args.connection_parallelibility}")
+        
+        if args.port_parallelability is not None:
+            old_val = config_dict.get('port_parallelability')
+            config_dict['port_parallelability'] = args.port_parallelability
+            if not is_new and old_val != args.port_parallelability:
+                changes.append(f"port_parallelability: {old_val} -> {args.port_parallelability}")
+        
+        if args.incoming_blocking_level is not None:
+            old_val = config_dict.get('incoming_blocking_level')
+            config_dict['incoming_blocking_level'] = str(args.incoming_blocking_level)
+            if not is_new and old_val != str(args.incoming_blocking_level):
+                changes.append(f"incoming_blocking_level: {old_val} -> {args.incoming_blocking_level}")
+        
+        if args.incoming_sleep is not None:
+            old_val = config_dict.get('incoming_sleep')
+            config_dict['incoming_sleep'] = str(args.incoming_sleep)
+            if not is_new and old_val != str(args.incoming_sleep):
+                changes.append(f"incoming_sleep: {old_val} -> {args.incoming_sleep}")
+        
+        if args.max_send_time is not None:
+            old_val = config_dict.get('max_send_time')
+            config_dict['max_send_time'] = str(args.max_send_time)
+            if not is_new and old_val != str(args.max_send_time):
+                changes.append(f"max_send_time: {old_val} -> {args.max_send_time}")
+        
+        if args.send_sleep is not None:
+            old_val = config_dict.get('send_sleep')
+            config_dict['send_sleep'] = str(args.send_sleep)
+            if not is_new and old_val != str(args.send_sleep):
+                changes.append(f"send_sleep: {old_val} -> {args.send_sleep}")
+        
+        if args.heartbeat_rate is not None:
+            old_val = config_dict.get('heartbeat_rate')
+            config_dict['heartbeat_rate'] = str(args.heartbeat_rate)
+            if not is_new and old_val != str(args.heartbeat_rate):
+                changes.append(f"heartbeat_rate: {old_val} -> {args.heartbeat_rate}")
+        
+        if args.adjustment_delay is not None:
+            old_val = config_dict.get('adjustment_delay')
+            config_dict['adjustment_delay'] = str(args.adjustment_delay)
+            if not is_new and old_val != str(args.adjustment_delay):
+                changes.append(f"adjustment_delay: {old_val} -> {args.adjustment_delay}")
+        
+        if args.flow_control_rate is not None:
+            old_val = config_dict.get('flow_control_rate')
+            config_dict['flow_control_rate'] = str(args.flow_control_rate)
+            if not is_new and old_val != str(args.flow_control_rate):
+                changes.append(f"flow_control_rate: {old_val} -> {args.flow_control_rate}")
+        
+        if args.server_block_time is not None:
+            old_val = config_dict.get('server_block_time')
+            config_dict['server_block_time'] = str(args.server_block_time)
+            if not is_new and old_val != str(args.server_block_time):
+                changes.append(f"server_block_time: {old_val} -> {args.server_block_time}")
+        
+        if args.client_block_time is not None:
+            old_val = config_dict.get('client_block_time')
+            config_dict['client_block_time'] = str(args.client_block_time)
+            if not is_new and old_val != str(args.client_block_time):
+                changes.append(f"client_block_time: {old_val} -> {args.client_block_time}")
+        
+        try:
+            # Create directory if needed
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write config file
+            with open(config_path, 'w') as f:
+                f.write("# wyndrvr configuration file\n")
+                f.write("# All time values: microseconds (unless specified otherwise)\n\n")
+                
+                f.write("# Server bind settings\n")
+                f.write(f"bind_addr={config_dict.get('bind_addr', '0.0.0.0')}\n")
+                f.write(f"bind_port={config_dict.get('bind_port', '6711')}\n\n")
+                
+                f.write("# Port ranges for client connections (format: start-end,start-end)\n")
+                f.write(f"port_ranges={config_dict.get('port_ranges', '7000-8000')}\n\n")
+                
+                f.write("# Parallelization modes: SINGLE, THREAD, PROCESS\n")
+                f.write(f"connection_parallelibility={config_dict.get('connection_parallelibility', 'SINGLE')}\n")
+                f.write(f"port_parallelability={config_dict.get('port_parallelability', 'SINGLE')}\n\n")
+                
+                f.write("# Incoming packet handling\n")
+                f.write(f"incoming_blocking_level={config_dict.get('incoming_blocking_level', '0')}\n")
+                f.write(f"incoming_sleep={config_dict.get('incoming_sleep', '0')}\n\n")
+                
+                f.write("# Outgoing packet handling\n")
+                f.write(f"max_send_time={config_dict.get('max_send_time', '0')}\n")
+                f.write(f"send_sleep={config_dict.get('send_sleep', '0')}\n\n")
+                
+                f.write("# Heartbeat and flow control (milliseconds for heartbeat_rate)\n")
+                f.write(f"heartbeat_rate={config_dict.get('heartbeat_rate', '5000')}\n")
+                f.write(f"adjustment_delay={config_dict.get('adjustment_delay', '1000000')}\n")
+                f.write(f"flow_control_rate={config_dict.get('flow_control_rate', '10')}\n\n")
+                
+                f.write("# Socket blocking times (milliseconds)\n")
+                f.write(f"server_block_time={config_dict.get('server_block_time', '100')}\n")
+                f.write(f"client_block_time={config_dict.get('client_block_time', '100')}\n")
+            
+            if is_new:
+                print(f"Created configuration file: {config_path}")
+            else:
+                if changes:
+                    print(f"WARNING: Edited existing configuration file: {config_path}")
+                    print("Changes made:")
+                    for change in changes:
+                        print(f"  {change}")
+                else:
+                    print(f"Configuration file unchanged: {config_path}")
+            
+            return True
+        except Exception as e:
+            print(f"Error updating config file: {e}", file=sys.stderr)
+            return False
+    
     def start(self):
         """Start the server"""
         self.running = True
@@ -241,6 +420,7 @@ client_block_time=100
             self.main_socket.setblocking(False)
         
         print(f"Server started on {self.config.bind_addr}:{self.config.bind_port}")
+        sys.stdout.flush()
         
         # Main server loop
         self.server_comm_loop()
@@ -282,6 +462,7 @@ client_block_time=100
             current_time = time.time()
             latency = (current_time - server_timestamp) * 1000  # Convert to milliseconds
             print(f"Server latency to {client_addr[0]}:{client_addr[1]}: {latency:.2f} ms", file=sys.stderr)
+            sys.stderr.flush()
             return
         
         if client_addr not in self.client_connections:
@@ -299,6 +480,7 @@ client_block_time=100
             print(f"  Control Port: {control_port}")
             print(f"  Upload Port: {upload_port}")
             print(f"  Download Port: {download_port}")
+            sys.stdout.flush()
             
             # Create sockets for this client's ports
             self.setup_client_sockets(control_port, upload_port, download_port)
@@ -349,6 +531,7 @@ class WyndClient:
         self.main_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
         print(f"Connecting to server {self.server_addr}:{self.server_port}")
+        sys.stdout.flush()
         
         # Send initial connection request
         self.main_socket.sendto(b"CONNECT", (self.server_addr, self.server_port))
@@ -376,6 +559,7 @@ class WyndClient:
             self.download_socket.sendto(b"HEARTBEAT", (self.server_addr, download_port))
             
             print("Client connected successfully")
+            sys.stdout.flush()
             
             # Initialize heartbeat timing
             self.last_heartbeat = time.time()
@@ -385,8 +569,10 @@ class WyndClient:
             
         except socket.timeout:
             print("Timeout waiting for server response", file=sys.stderr)
+            self.running = False
         except Exception as e:
             print(f"Error connecting to server: {e}", file=sys.stderr)
+            self.running = False
     
     def client_comm_loop(self):
         """Main client communication loop - handles heartbeat timing and responses"""
@@ -417,6 +603,7 @@ class WyndClient:
                     # Calculate round-trip latency
                     latency = (current_time - client_timestamp) * 1000  # milliseconds
                     print(f"Client latency: {latency:.2f} ms", file=sys.stderr)
+                    sys.stderr.flush()
                     
                     # Send final echo back to server
                     final_echo = b"HEARTBEAT_FINAL:" + struct.pack('dd', client_timestamp, server_timestamp)
@@ -460,11 +647,15 @@ def resolve_config_path(config_arg: Optional[str]) -> Path:
     if config_arg is None:
         return Path.home() / '.wyndrvr' / 'config'
     
-    config_path = Path(config_arg).expanduser()
+    config_path = Path(config_arg).expanduser().resolve()
     
-    # If it's a directory or doesn't have an extension, append 'config' filename
-    if config_path.is_dir() or (not config_path.suffix and not config_path.exists()):
+    # If it's an existing directory, append 'config' filename
+    if config_path.is_dir():
         config_path = config_path / 'config'
+    # If it doesn't exist and has no extension, treat as config file name
+    elif not config_path.exists() and not config_path.suffix:
+        # Don't append 'config' if the name itself looks like a config file
+        pass
     
     return config_path
 
@@ -492,6 +683,86 @@ def main():
         help='Create a default config file'
     )
     parser.add_argument(
+        '--bind-addr',
+        metavar='addr',
+        help='Server bind address (default: 0.0.0.0)'
+    )
+    parser.add_argument(
+        '--bind-port',
+        type=int,
+        metavar='port',
+        help='Server bind port (default: 6711)'
+    )
+    parser.add_argument(
+        '--port-ranges',
+        metavar='ranges',
+        help='Port ranges for clients (format: 7000-8000,9000-9500)'
+    )
+    parser.add_argument(
+        '--connection-parallelibility',
+        choices=['SINGLE', 'THREAD', 'PROCESS'],
+        help='Connection parallelization mode'
+    )
+    parser.add_argument(
+        '--port-parallelability',
+        choices=['SINGLE', 'THREAD', 'PROCESS'],
+        help='Port parallelization mode'
+    )
+    parser.add_argument(
+        '--incoming-blocking-level',
+        type=int,
+        metavar='microseconds',
+        help='Incoming blocking level in microseconds'
+    )
+    parser.add_argument(
+        '--incoming-sleep',
+        type=int,
+        metavar='microseconds',
+        help='Incoming sleep time in microseconds'
+    )
+    parser.add_argument(
+        '--max-send-time',
+        type=int,
+        metavar='microseconds',
+        help='Maximum send time in microseconds'
+    )
+    parser.add_argument(
+        '--send-sleep',
+        type=int,
+        metavar='microseconds',
+        help='Send sleep time in microseconds'
+    )
+    parser.add_argument(
+        '--heartbeat-rate',
+        type=int,
+        metavar='milliseconds',
+        help='Heartbeat rate in milliseconds (default: 5000)'
+    )
+    parser.add_argument(
+        '--adjustment-delay',
+        type=int,
+        metavar='microseconds',
+        help='Adjustment delay in microseconds'
+    )
+    parser.add_argument(
+        '--flow-control-rate',
+        type=int,
+        metavar='rate',
+        help='Flow control rate divider'
+    )
+    parser.add_argument(
+        '--server-block-time',
+        type=int,
+        metavar='milliseconds',
+        help='Server socket block time in milliseconds (default: 100)'
+    )
+    parser.add_argument(
+        '--client-block-time',
+        type=int,
+        metavar='milliseconds',
+        help='Client socket block time in milliseconds (default: 100)'
+    )
+    parser.add_argument(
         'client_target',
         nargs='?',
         metavar='[addr]:[port]',
@@ -506,10 +777,28 @@ def main():
     # Handle --create-config
     if args.create_config:
         server = WyndServer(ServerConfig())
-        if server.create_default_config(config_path):
-            sys.exit(0)
+        # Check if any config arguments were provided
+        has_config_args = any([
+            args.bind_addr, args.bind_port, args.port_ranges,
+            args.connection_parallelibility, args.port_parallelability,
+            args.incoming_blocking_level, args.incoming_sleep,
+            args.max_send_time, args.send_sleep, args.heartbeat_rate,
+            args.adjustment_delay, args.flow_control_rate,
+            args.server_block_time, args.client_block_time
+        ])
+        
+        if has_config_args:
+            # Use update method to handle command line args
+            if server.update_config_from_args(config_path, args):
+                sys.exit(0)
+            else:
+                sys.exit(1)
         else:
-            sys.exit(1)
+            # Use default creation
+            if server.create_default_config(config_path):
+                sys.exit(0)
+            else:
+                sys.exit(1)
     
     # Determine mode
     if args.server is not None:
