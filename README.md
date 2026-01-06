@@ -39,6 +39,20 @@ cd wyndrvr
 chmod +x wyndrvr_server.py wyndrvr_client.py
 ```
 
+## Quick Start
+
+Try the automated demo that showcases all features:
+
+```bash
+python example_test.py
+```
+
+This will automatically:
+1. Start a server in the background
+2. Run various client tests (latency, download, upload, concurrent)
+3. Display comprehensive results
+4. Clean up automatically
+
 ## Usage
 
 ### Starting the Server
@@ -182,11 +196,34 @@ Simple text-based protocol:
 
 ## Technical Concepts Demonstrated
 
-1. **Socket Programming**: TCP client-server communication
-2. **Threading**: Concurrent client handling and testing
-3. **Multiprocessing**: Process-based server concurrency
-4. **Network Performance Metrics**: RTT, bandwidth, throughput
-5. **Statistical Analysis**: Min, max, average, standard deviation
+This project demonstrates several important networking and concurrency concepts:
+
+### 1. Socket Programming
+- **TCP Sockets**: Reliable, connection-oriented communication
+- **Server Socket**: Binds to address/port and listens for connections
+- **Client Socket**: Connects to server and exchanges data
+- **Binary Protocol**: Simple text-based commands (PING, BANDWIDTH_DOWNLOAD, etc.)
+
+### 2. Threading
+- **Server Threading**: Each client connection runs in a separate thread
+  - Allows multiple clients to connect simultaneously
+  - Shared resources between threads (socket handlers)
+  - Daemon threads for automatic cleanup
+- **Client Threading**: Concurrent testing mode spawns multiple client threads
+  - Demonstrates parallel network operations
+  - Thread-safe result collection with locks
+
+### 3. Multiprocessing
+- **Process-based Server**: Alternative to threading using separate processes
+  - Each client connection handled by dedicated process
+  - Process isolation (separate memory space)
+  - Better for CPU-bound operations
+  - Demonstrates both threading and process-based concurrency
+
+### 4. Network Performance Metrics
+- **Latency (RTT)**: Round-trip time measurement using PING/PONG
+- **Bandwidth**: Data transfer rate in Mbps (upload and download)
+- **Statistical Analysis**: Min, max, average, standard deviation
 
 ## Requirements
 
@@ -201,6 +238,11 @@ The implementation uses Python's standard library exclusively, so no additional 
 2. Run various client tests in other terminals
 3. Try concurrent clients to see threading in action
 4. Switch server modes to compare thread vs process handling
+
+Or simply run the automated demo:
+```bash
+python example_test.py
+```
 
 ## License
 
