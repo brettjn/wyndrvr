@@ -266,90 +266,32 @@ client_block_time=100
         # Track changes
         changes = []
         
-        # Update with command line arguments
-        if args.bind_addr is not None:
-            old_val = config_dict.get('bind_addr')
-            config_dict['bind_addr'] = args.bind_addr
-            if not is_new and old_val != args.bind_addr:
-                changes.append(f"bind_addr: {old_val} -> {args.bind_addr}")
+        # Update with command line arguments - loop through all config parameters
+        config_params = [
+            ('bind_addr', 'bind_addr', False),
+            ('bind_port', 'bind_port', True),
+            ('port_ranges', 'port_ranges', False),
+            ('connection_parallelibility', 'connection_parallelibility', False),
+            ('port_parallelability', 'port_parallelability', False),
+            ('incoming_blocking_level', 'incoming_blocking_level', True),
+            ('incoming_sleep', 'incoming_sleep', True),
+            ('max_send_time', 'max_send_time', True),
+            ('send_sleep', 'send_sleep', True),
+            ('heartbeat_rate', 'heartbeat_rate', True),
+            ('adjustment_delay', 'adjustment_delay', True),
+            ('flow_control_rate', 'flow_control_rate', True),
+            ('server_block_time', 'server_block_time', True),
+            ('client_block_time', 'client_block_time', True),
+        ]
         
-        if args.bind_port is not None:
-            old_val = config_dict.get('bind_port')
-            config_dict['bind_port'] = str(args.bind_port)
-            if not is_new and old_val != str(args.bind_port):
-                changes.append(f"bind_port: {old_val} -> {args.bind_port}")
-        
-        if args.port_ranges is not None:
-            old_val = config_dict.get('port_ranges')
-            config_dict['port_ranges'] = args.port_ranges
-            if not is_new and old_val != args.port_ranges:
-                changes.append(f"port_ranges: {old_val} -> {args.port_ranges}")
-        
-        if args.connection_parallelibility is not None:
-            old_val = config_dict.get('connection_parallelibility')
-            config_dict['connection_parallelibility'] = args.connection_parallelibility
-            if not is_new and old_val != args.connection_parallelibility:
-                changes.append(f"connection_parallelibility: {old_val} -> {args.connection_parallelibility}")
-        
-        if args.port_parallelability is not None:
-            old_val = config_dict.get('port_parallelability')
-            config_dict['port_parallelability'] = args.port_parallelability
-            if not is_new and old_val != args.port_parallelability:
-                changes.append(f"port_parallelability: {old_val} -> {args.port_parallelability}")
-        
-        if args.incoming_blocking_level is not None:
-            old_val = config_dict.get('incoming_blocking_level')
-            config_dict['incoming_blocking_level'] = str(args.incoming_blocking_level)
-            if not is_new and old_val != str(args.incoming_blocking_level):
-                changes.append(f"incoming_blocking_level: {old_val} -> {args.incoming_blocking_level}")
-        
-        if args.incoming_sleep is not None:
-            old_val = config_dict.get('incoming_sleep')
-            config_dict['incoming_sleep'] = str(args.incoming_sleep)
-            if not is_new and old_val != str(args.incoming_sleep):
-                changes.append(f"incoming_sleep: {old_val} -> {args.incoming_sleep}")
-        
-        if args.max_send_time is not None:
-            old_val = config_dict.get('max_send_time')
-            config_dict['max_send_time'] = str(args.max_send_time)
-            if not is_new and old_val != str(args.max_send_time):
-                changes.append(f"max_send_time: {old_val} -> {args.max_send_time}")
-        
-        if args.send_sleep is not None:
-            old_val = config_dict.get('send_sleep')
-            config_dict['send_sleep'] = str(args.send_sleep)
-            if not is_new and old_val != str(args.send_sleep):
-                changes.append(f"send_sleep: {old_val} -> {args.send_sleep}")
-        
-        if args.heartbeat_rate is not None:
-            old_val = config_dict.get('heartbeat_rate')
-            config_dict['heartbeat_rate'] = str(args.heartbeat_rate)
-            if not is_new and old_val != str(args.heartbeat_rate):
-                changes.append(f"heartbeat_rate: {old_val} -> {args.heartbeat_rate}")
-        
-        if args.adjustment_delay is not None:
-            old_val = config_dict.get('adjustment_delay')
-            config_dict['adjustment_delay'] = str(args.adjustment_delay)
-            if not is_new and old_val != str(args.adjustment_delay):
-                changes.append(f"adjustment_delay: {old_val} -> {args.adjustment_delay}")
-        
-        if args.flow_control_rate is not None:
-            old_val = config_dict.get('flow_control_rate')
-            config_dict['flow_control_rate'] = str(args.flow_control_rate)
-            if not is_new and old_val != str(args.flow_control_rate):
-                changes.append(f"flow_control_rate: {old_val} -> {args.flow_control_rate}")
-        
-        if args.server_block_time is not None:
-            old_val = config_dict.get('server_block_time')
-            config_dict['server_block_time'] = str(args.server_block_time)
-            if not is_new and old_val != str(args.server_block_time):
-                changes.append(f"server_block_time: {old_val} -> {args.server_block_time}")
-        
-        if args.client_block_time is not None:
-            old_val = config_dict.get('client_block_time')
-            config_dict['client_block_time'] = str(args.client_block_time)
-            if not is_new and old_val != str(args.client_block_time):
-                changes.append(f"client_block_time: {old_val} -> {args.client_block_time}")
+        for arg_name, config_key, convert_to_str in config_params:
+            arg_value = getattr(args, arg_name, None)
+            if arg_value is not None:
+                old_val = config_dict.get(config_key)
+                new_val = str(arg_value) if convert_to_str else arg_value
+                config_dict[config_key] = new_val
+                if not is_new and old_val != new_val:
+                    changes.append(f"{config_key}: {old_val} -> {arg_value}")
         
         try:
             # Create directory if needed
