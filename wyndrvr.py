@@ -4,15 +4,28 @@ wyndrvr - Latency and Bandwidth Utility
 A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
-__version__ = "0.1"
+__version__ = "0.3"
 __version_notes__ = """
+Version 0.3:
+- Added --config option to specify custom config file location
+- Added --create-config option to generate default config file
+- Added server_block_time and client_block_time settings (default 100ms)
+- Client socket blocking uses configured block_time (non-blocking if zero)
+- Config path can be directory or full file path
+- Client loads client_block_time from config file
+
+Version 0.2:
+- Refactored to use client_comm_loop and server_comm_loop
+- Heartbeat handling integrated into main communication loops
+- Removed separate heartbeat thread (unless port_parallelability is THREAD/PROCESS)
+- Server loop handles port assignments and heartbeat exchanges
+- Client loop handles heartbeat timing and responses
+
 Version 0.1:
-- Implemented heartbeat exchange protocol with timestamp handling
+- Initial implementation with heartbeat exchange protocol
 - Client initiates heartbeat, server echoes, client sends final echo
 - Both client and server calculate and report latency to stderr
 - Heartbeat rate changed to milliseconds (default 5000ms)
-- Fixed byte length validation for heartbeat messages
-- Added immediate first heartbeat on client connection
 """
 
 import argparse
@@ -52,6 +65,8 @@ class ServerConfig:
     heartbeat_rate: int = 5000  # milliseconds (5 seconds)
     adjustment_delay: int = 1000000  # microseconds (1 second)
     flow_control_rate: int = 10  # divider for adjustment_delay
+    server_block_time: int = 100  # milliseconds
+    client_block_time: int = 100  # milliseconds
     
     def __post_init__(self):
         if self.port_ranges is None:
@@ -153,10 +168,62 @@ class WyndServer:
                             config.adjustment_delay = int(value)
                         elif key == 'flow_control_rate':
                             config.flow_control_rate = int(value)
+                        elif key == 'server_block_time':
+                            config.server_block_time = int(value)
+                        elif key == 'client_block_time':
+                            config.client_block_time = int(value)
         except Exception as e:
             print(f"Error loading config: {e}", file=sys.stderr)
         
         return config
+    
+    def create_default_config(self, config_path: Path) -> bool:
+        """Create a default configuration file"""
+        default_config = """# wyndrvr configuration file
+# All time values: microseconds (unless specified otherwise)
+
+# Server bind settings
+bind_addr=0.0.0.0
+bind_port=6711
+
+# Port ranges for client connections (format: start-end,start-end)
+port_ranges=7000-8000
+
+# Parallelization modes: SINGLE, THREAD, PROCESS
+connection_parallelibility=SINGLE
+port_parallelability=SINGLE
+
+# Incoming packet handling
+incoming_blocking_level=0
+incoming_sleep=0
+
+# Outgoing packet handling
+max_send_time=0
+send_sleep=0
+
+# Heartbeat and flow control (milliseconds for heartbeat_rate)
+heartbeat_rate=5000
+adjustment_delay=1000000
+flow_control_rate=10
+
+# Socket blocking times (milliseconds)
+server_block_time=100
+client_block_time=100
+"""
+        
+        try:
+            # Create directory if it doesn't exist
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write config file
+            with open(config_path, 'w') as f:
+                f.write(default_config)
+            
+            print(f"Created default configuration file: {config_path}")
+            return True
+        except Exception as e:
+            print(f"Error creating config file: {e}", file=sys.stderr)
+            return False
     
     def start(self):
         """Start the server"""
@@ -166,9 +233,9 @@ class WyndServer:
         self.main_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.main_socket.bind((self.config.bind_addr, self.config.bind_port))
         
-        # Set socket timeout based on incoming_blocking_level
-        if self.config.incoming_blocking_level > 0:
-            timeout = self.config.incoming_blocking_level / 1_000_000  # Convert to seconds
+        # Set socket timeout based on server_block_time
+        if self.config.server_block_time > 0:
+            timeout = self.config.server_block_time / 1000  # Convert milliseconds to seconds
             self.main_socket.settimeout(timeout)
         else:
             self.main_socket.setblocking(False)
@@ -176,10 +243,10 @@ class WyndServer:
         print(f"Server started on {self.config.bind_addr}:{self.config.bind_port}")
         
         # Main server loop
-        self.run_server_loop()
+        self.server_comm_loop()
     
-    def run_server_loop(self):
-        """Main server communication loop"""
+    def server_comm_loop(self):
+        """Main server communication loop - handles port assignments and heartbeats"""
         while self.running:
             try:
                 # Receive incoming packets
@@ -262,7 +329,7 @@ class WyndServer:
 class WyndClient:
     """UDP Client for wyndrvr"""
     
-    def __init__(self, server_addr: str, server_port: int):
+    def __init__(self, server_addr: str, server_port: int, block_time: int = 100):
         self.server_addr = server_addr
         self.server_port = server_port
         self.main_socket = None
@@ -272,6 +339,7 @@ class WyndClient:
         self.running = False
         self.heartbeat_interval = 5.0  # seconds
         self.last_heartbeat = 0
+        self.block_time = block_time  # milliseconds
     
     def start(self):
         """Start the client and connect to server"""
@@ -309,22 +377,28 @@ class WyndClient:
             
             print("Client connected successfully")
             
-            # Initialize heartbeat timing and send first heartbeat
+            # Initialize heartbeat timing
             self.last_heartbeat = time.time()
-            self.send_heartbeat()
             
-            # Start heartbeat thread
-            self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
-            self.heartbeat_thread.start()
+            # Run main client communication loop
+            self.client_comm_loop()
             
         except socket.timeout:
             print("Timeout waiting for server response", file=sys.stderr)
         except Exception as e:
             print(f"Error connecting to server: {e}", file=sys.stderr)
     
-    def heartbeat_loop(self):
-        """Send periodic heartbeats and measure latency"""
-        self.main_socket.setblocking(False)
+    def client_comm_loop(self):
+        """Main client communication loop - handles heartbeat timing and responses"""
+        # Set socket blocking based on configured block_time
+        if self.block_time > 0:
+            timeout = self.block_time / 1000  # Convert milliseconds to seconds
+            self.main_socket.settimeout(timeout)
+        else:
+            self.main_socket.setblocking(False)
+        
+        # Send initial heartbeat
+        self.send_heartbeat()
         
         while self.running:
             current_time = time.time()
@@ -333,7 +407,7 @@ class WyndClient:
                 self.send_heartbeat()
                 self.last_heartbeat = current_time
             
-            # Check for heartbeat responses
+            # Check for heartbeat responses (blocks up to 0.1 seconds)
             try:
                 data, _ = self.main_socket.recvfrom(4096)
                 if data.startswith(b"HEARTBEAT_ECHO:") and len(data) >= 31:
@@ -347,12 +421,10 @@ class WyndClient:
                     # Send final echo back to server
                     final_echo = b"HEARTBEAT_FINAL:" + struct.pack('dd', client_timestamp, server_timestamp)
                     self.main_socket.sendto(final_echo, (self.server_addr, self.server_port))
-            except BlockingIOError:
+            except socket.timeout:
                 pass
             except Exception as e:
-                print(f"Error in heartbeat loop: {e}", file=sys.stderr)
-            
-            time.sleep(0.1)  # Small sleep to avoid busy waiting
+                print(f"Error in client comm loop: {e}", file=sys.stderr)
     
     def send_heartbeat(self):
         """Send heartbeat with timestamp to server"""
@@ -383,6 +455,20 @@ def parse_addr_port(addr_port_str: str, default_addr: str = "0.0.0.0",
     return addr, port
 
 
+def resolve_config_path(config_arg: Optional[str]) -> Path:
+    """Resolve config path from argument - can be directory or full file path"""
+    if config_arg is None:
+        return Path.home() / '.wyndrvr' / 'config'
+    
+    config_path = Path(config_arg).expanduser()
+    
+    # If it's a directory or doesn't have an extension, append 'config' filename
+    if config_path.is_dir() or (not config_path.suffix and not config_path.exists()):
+        config_path = config_path / 'config'
+    
+    return config_path
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
@@ -396,6 +482,16 @@ def main():
         help='Run in server mode with optional bind address and port'
     )
     parser.add_argument(
+        '--config',
+        metavar='path',
+        help='Path to config file or directory (default: ~/.wyndrvr/config)'
+    )
+    parser.add_argument(
+        '--create-config',
+        action='store_true',
+        help='Create a default config file'
+    )
+    parser.add_argument(
         'client_target',
         nargs='?',
         metavar='[addr]:[port]',
@@ -404,16 +500,28 @@ def main():
     
     args = parser.parse_args()
     
+    # Resolve config path
+    config_path = resolve_config_path(args.config)
+    
+    # Handle --create-config
+    if args.create_config:
+        server = WyndServer(ServerConfig())
+        if server.create_default_config(config_path):
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    
     # Determine mode
     if args.server is not None:
         # Server mode
-        config_path = Path.home() / '.wyndrvr' / 'config'
         config = ServerConfig()
         
         # Load config file if exists
         server = WyndServer(config)
         if config_path.exists():
             config = server.load_config(config_path)
+        elif args.config:
+            print(f"Warning: Config file not found: {config_path}", file=sys.stderr)
         
         # Override with command line arguments if provided
         if args.server:
@@ -433,7 +541,14 @@ def main():
         # Client mode
         addr, port = parse_addr_port(args.client_target, default_port=6711)
         
-        client = WyndClient(addr, port)
+        # Load config to get client_block_time if available
+        block_time = 100  # default
+        if config_path.exists():
+            server = WyndServer(ServerConfig())
+            config = server.load_config(config_path)
+            block_time = config.client_block_time
+        
+        client = WyndClient(addr, port, block_time)
         
         try:
             client.start()
