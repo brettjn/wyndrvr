@@ -4,8 +4,15 @@ wyndrvr - Latency and Bandwidth Utility
 A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
-__version__ = "0.4"
+
+__version__ = "0.5"
 __version_notes__ = """
+Version 0.5:
+- Bumped version to 0.5.
+- Fixed indentation bug causing an IndentationError on server startup.
+- Added graceful server shutdown to print per-channel latency summary on Ctrl+C.
+- Improved heartbeat handling: binary MessagePacket format, per-port heartbeats, and latency aggregation.
+
 Version 0.4:
 - Added command line arguments for all config settings (--bind-addr, --bind-port, etc.)
 - Config file creation/editing with command line arguments
@@ -43,10 +50,12 @@ import multiprocessing
 import time
 import select
 import struct
+import json
 from pathlib import Path
 from enum import Enum
 from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
+import signal
 
 
 class ParallelMode(Enum):
@@ -54,6 +63,72 @@ class ParallelMode(Enum):
     SINGLE = "SINGLE"
     THREAD = "THREAD"
     PROCESS = "PROCESS"
+
+
+class MessageType(Enum):
+    """Message types for packet header"""
+    HEARTBEAT_0 = 0
+    HEARTBEAT_1 = 1
+    HEARTBEAT_2 = 2
+    FLOW_CONTROL = 3
+    BANDWIDTH_TEST = 4
+    DATA = 5
+
+
+class MessagePacket:
+    """Helper to format/unformat the 20-byte header + JSON payload packets.
+
+    Header layout (20 bytes):
+      1 byte  - MessageType (int)
+      3 bytes - data_channel (unsigned int, big-endian)
+      8 bytes - channel_sequence_number (unsigned long long, big-endian)
+      8 bytes - sequence_offset (unsigned long long, big-endian)
+    Remaining bytes: UTF-8 encoded JSON payload
+    """
+
+    HEADER_LEN = 20
+
+    @classmethod
+    def format_packet(cls, msg_type, data_channel: int, channel_sequence_number: int, sequence_offset: int, json_obj) -> bytes:
+        mt = int(msg_type.value) if isinstance(msg_type, MessageType) else int(msg_type)
+        # 1 byte message type
+        header = bytes([mt])
+        # 3 bytes data_channel
+        header += int(data_channel).to_bytes(3, 'big')
+        # 8 bytes channel_sequence_number
+        header += struct.pack('>Q', int(channel_sequence_number))
+        # 8 bytes sequence_offset
+        header += struct.pack('>Q', int(sequence_offset))
+
+        body = json.dumps(json_obj).encode('utf-8') if json_obj is not None else b''
+
+        return header + body
+
+    @classmethod
+    def parse_packet(cls, data: bytes):
+        if not data or len(data) < cls.HEADER_LEN:
+            raise ValueError('Packet too short to parse')
+
+        mt_val = data[0]
+        try:
+            mt = MessageType(mt_val)
+        except ValueError:
+            mt = mt_val
+
+        data_channel = int.from_bytes(data[1:4], 'big')
+        channel_sequence_number = struct.unpack('>Q', data[4:12])[0]
+        sequence_offset = struct.unpack('>Q', data[12:20])[0]
+
+        json_bytes = data[20:]
+        if json_bytes:
+            try:
+                json_obj = json.loads(json_bytes.decode('utf-8'))
+            except Exception:
+                json_obj = None
+        else:
+            json_obj = None
+
+        return mt, data_channel, channel_sequence_number, sequence_offset, json_obj
 
 
 @dataclass
@@ -95,24 +170,203 @@ class PortManager:
                 for port in range(start, end + 1):
                     if port not in self.used_ports:
                         available_ports.append(port)
-                        if len(available_ports) == count:
-                            break
-                if len(available_ports) == count:
-                    break
             
             if len(available_ports) < count:
                 return None
             
-            for port in available_ports:
+            return available_ports[:count]
+    
+    def mark_ports_used(self, ports: List[int]):
+        """Mark ports as used"""
+        with self.lock:
+            for port in ports:
                 self.used_ports.add(port)
-            
-            return available_ports
     
     def release_ports(self, ports: List[int]):
         """Release previously allocated ports"""
         with self.lock:
             for port in ports:
                 self.used_ports.discard(port)
+
+
+class ServerClientComms:
+    """Handles communication with a specific client over three UDP ports"""
+    
+    def __init__(self, client_addr: Tuple[str, int], bind_addr: str, port_manager: PortManager, server_ref: 'WyndServer' = None):
+        self.client_addr = client_addr
+        self.bind_addr = bind_addr
+        self.server = server_ref
+        self.control_port = None
+        self.upload_port = None
+        self.download_port = None
+        self.control_socket = None
+        self.upload_socket = None
+        self.download_socket = None
+        self.heartbeat_key = int(time.time() * 1000) % 60001
+        self.comms_up = False
+        self.control_received = False
+        self.upload_received = False
+        self.download_received = False
+        
+        # Try to allocate and bind three ports
+        if not self._initialize_sockets(port_manager):
+            raise RuntimeError("Failed to allocate ports for client")
+    
+    def _initialize_sockets(self, port_manager: PortManager) -> bool:
+        """Initialize three sockets for the client, trying ports until successful"""
+        available_ports = port_manager.allocate_ports(count=100)  # Get many candidates
+        if not available_ports or len(available_ports) < 3:
+            return False
+        
+        allocated_ports = []
+        sockets = []
+        
+        # Try to bind three sockets
+        for port in available_ports:
+            if len(allocated_ports) >= 3:
+                break
+            
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind((self.bind_addr, port))
+                sock.setblocking(False)
+                allocated_ports.append(port)
+                sockets.append(sock)
+            except OSError:
+                # Port binding failed, try next port
+                if sock:
+                    try:
+                        sock.close()
+                    except:
+                        pass
+                continue
+        
+        if len(allocated_ports) < 3:
+            # Clean up any sockets we did create
+            for sock in sockets:
+                try:
+                    sock.close()
+                except:
+                    pass
+            return False
+        
+        # Success - assign the ports and sockets
+        self.control_port = allocated_ports[0]
+        self.upload_port = allocated_ports[1]
+        self.download_port = allocated_ports[2]
+        self.control_socket = sockets[0]
+        self.upload_socket = sockets[1]
+        self.download_socket = sockets[2]
+        
+        # Mark ports as used
+        port_manager.mark_ports_used(allocated_ports)
+        
+        return True
+    
+    def get_ports(self) -> Tuple[int, int, int]:
+        """Return the three port numbers"""
+        return (self.control_port, self.upload_port, self.download_port)
+    
+    def get_heartbeat_key(self) -> bytes:
+        """Return the heartbeat key"""
+        return self.heartbeat_key
+
+    def _record_latency(self, port_label: str, latency_ms: float):
+        if self.server:
+            self.server.record_latency(port_label, latency_ms)
+    
+    def handle_client_connection(self, data: bytes, port_type: str, src_addr: Optional[Tuple[str,int]] = None) -> bool:
+        """Handle data received on one of the client's ports
+        
+        Args:
+            data: The received data
+            port_type: One of 'control', 'upload', or 'download'
+            
+        Returns:
+            True if data was received and processed, False otherwise
+        """
+        if not data:
+            return False
+        
+        # Mark that this port has received data
+        if port_type == 'control':
+            self.control_received = True
+        elif port_type == 'upload':
+            self.upload_received = True
+        elif port_type == 'download':
+            self.download_received = True
+        
+        # Check if all three ports have received at least one packet
+        if self.control_received and self.upload_received and self.download_received:
+            if not self.comms_up:
+                print(f"Client {self.client_addr[0]}:{self.client_addr[1]} - all ports active, comms_up=True")
+                sys.stdout.flush()
+            self.comms_up = True
+        
+        # Try parse as MessagePacket and handle heartbeat latency printing or replies
+        try:
+            mt, data_channel, channel_sequence_number, sequence_offset, json_obj = MessagePacket.parse_packet(data)
+        except Exception:
+            return True
+
+        # Only compute/print latency for heartbeat messages
+        if isinstance(mt, MessageType):
+            port_label = {
+                'control': 'CONTROL',
+                'upload': 'UPLOAD',
+                'download': 'DOWNLOAD'
+            }.get(port_type, 'UNKNOWN')
+
+            # HEARTBEAT_0 -> server should reply with HEARTBEAT_1 on this same socket
+            if mt == MessageType.HEARTBEAT_0:
+                server_time = time.time()
+                client_ts = None
+                if isinstance(json_obj, dict):
+                    client_ts = json_obj.get('timestamp')
+
+                resp_json = {'client_timestamp': client_ts, 'server_timestamp': server_time}
+                resp = MessagePacket.format_packet(MessageType.HEARTBEAT_1, data_channel, channel_sequence_number, sequence_offset, resp_json)
+                # send on appropriate socket back to the source address if available
+                if src_addr:
+                    if port_type == 'control' and self.control_socket:
+                        try:
+                            self.control_socket.sendto(resp, src_addr)
+                        except Exception:
+                            pass
+                    elif port_type == 'upload' and self.upload_socket:
+                        try:
+                            self.upload_socket.sendto(resp, src_addr)
+                        except Exception:
+                            pass
+                    elif port_type == 'download' and self.download_socket:
+                        try:
+                            self.download_socket.sendto(resp, src_addr)
+                        except Exception:
+                            pass
+
+            # HEARTBEAT_2 -> server computes latency when receiving final echo on this port
+            if mt == MessageType.HEARTBEAT_2:
+                server_ts = None
+                if isinstance(json_obj, dict):
+                    server_ts = json_obj.get('server_timestamp')
+
+                if server_ts is not None:
+                    current_time = time.time()
+                    latency = (current_time - server_ts) * 1000
+                    print(f"Server latency on {port_label} to {self.client_addr[0]}:{self.client_addr[1]}: {latency:.2f} ms", file=sys.stderr)
+                    sys.stderr.flush()
+                    self._record_latency(port_label, latency)
+
+        return True
+    
+    def close(self):
+        """Close all sockets"""
+        for sock in [self.control_socket, self.upload_socket, self.download_socket]:
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
 
 
 class WyndServer:
@@ -123,8 +377,30 @@ class WyndServer:
         self.port_manager = PortManager(config.port_ranges)
         self.running = False
         self.main_socket = None
-        self.client_connections = {}  # client_addr -> (control_port, upload_port, download_port)
-        self.client_sockets = {}  # port -> socket for client connections
+        self.client_connections = {}  # client_addr -> ServerClientComms instance
+        # latency stats per channel: {'MAIN': {'sum':0.0,'count':0}, ...}
+        self._latency_stats: Dict[str, Dict[str, float]] = {
+            'MAIN': {'sum': 0.0, 'count': 0},
+            'CONTROL': {'sum': 0.0, 'count': 0},
+            'UPLOAD': {'sum': 0.0, 'count': 0},
+            'DOWNLOAD': {'sum': 0.0, 'count': 0},
+        }
+
+    def record_latency(self, port_label: str, latency_ms: float):
+        label = port_label.upper()
+        if label not in self._latency_stats:
+            self._latency_stats[label] = {'sum': 0.0, 'count': 0}
+        self._latency_stats[label]['sum'] += float(latency_ms)
+        self._latency_stats[label]['count'] += 1
+
+    def print_latency_summary(self):
+        print("\nServer latency summary:")
+        for label, data in self._latency_stats.items():
+            if data['count'] > 0:
+                avg = data['sum'] / data['count']
+                print(f"  {label}: avg={avg:.2f} ms over {int(data['count'])} samples")
+            else:
+                print(f"  {label}: no samples")
     
     def load_config(self, config_path: Path) -> ServerConfig:
         """Load configuration from file"""
@@ -371,9 +647,46 @@ client_block_time=100
         """Main server communication loop - handles port assignments and heartbeats"""
         while self.running:
             try:
-                # Receive incoming packets
+                # Receive incoming packets on main socket
                 data, client_addr = self.main_socket.recvfrom(4096)
-                self.handle_client_connection(client_addr, data)
+                
+                # Handle new client connections or heartbeat messages
+                if data.startswith(b"CONNECT") or client_addr not in self.client_connections:
+                    # Create ServerClientComms instance for new client
+                    if client_addr not in self.client_connections:
+                        try:
+                            client_comms = ServerClientComms(client_addr, self.config.bind_addr, self.port_manager, server_ref=self)
+                            self.client_connections[client_addr] = client_comms
+                            
+                            control_port, upload_port, download_port = client_comms.get_ports()
+                            
+                            print(f"Client connected: {client_addr[0]}:{client_addr[1]}")
+                            print(f"  Control Port: {control_port}")
+                            print(f"  Upload Port: {upload_port}")
+                            print(f"  Download Port: {download_port}")
+                            sys.stdout.flush()
+                        except RuntimeError as e:
+                            print(f"Failed to allocate ports for client {client_addr}: {e}", file=sys.stderr)
+                            continue
+                    
+                    # Send port information if comms not yet up
+                    client_comms = self.client_connections[client_addr]
+                    if not client_comms.comms_up:
+                        ports = client_comms.get_ports()
+                        heartbeat_key = client_comms.get_heartbeat_key()
+                        response = f"{ports[0]},{ports[1]},{ports[2]},{heartbeat_key}".encode()
+                        self.main_socket.sendto(response, client_addr)
+                else:
+                    # Try parsing as our binary MessagePacket (heartbeat, etc.)
+                    try:
+                        mt, data_channel, channel_seq, seq_offset, json_obj = MessagePacket.parse_packet(data)
+                        # Only handle heartbeat types here
+                        if isinstance(mt, MessageType) and mt in (MessageType.HEARTBEAT_0, MessageType.HEARTBEAT_1, MessageType.HEARTBEAT_2):
+                            self.handle_heartbeat_message(client_addr, data)
+                    except Exception:
+                        # Not a MessagePacket - ignore or handled elsewhere
+                        pass
+                        
             except socket.timeout:
                 pass
             except BlockingIOError:
@@ -381,73 +694,105 @@ client_block_time=100
             except Exception as e:
                 print(f"Error in server loop: {e}", file=sys.stderr)
             
+            # Poll all client sockets for data
+            for client_addr, client_comms in list(self.client_connections.items()):
+                # Poll control socket
+                try:
+                    data, src = client_comms.control_socket.recvfrom(4096)
+                    #print(f"received {len(data)} bytes of packet data on control port")
+                    client_comms.handle_client_connection(data, 'control', src)
+                except BlockingIOError:
+                    pass
+                except Exception as e:
+                    pass
+                
+                # Poll upload socket
+                try:
+                    data, src = client_comms.upload_socket.recvfrom(4096)
+                    #print(f"received {len(data)} bytes of packet data on upload port")
+                    client_comms.handle_client_connection(data, 'upload', src)
+                except BlockingIOError:
+                    pass
+                except Exception as e:
+                    pass
+                
+                # Poll download socket
+                try:
+                    data, src = client_comms.download_socket.recvfrom(4096)
+                    #print(f"received {len(data)} bytes of packet data on download port")
+                    client_comms.handle_client_connection(data, 'download', src)
+                except BlockingIOError:
+                    pass
+                except Exception as e:
+                    pass
+            
             # Sleep if configured
             if self.config.incoming_sleep > 0:
                 time.sleep(self.config.incoming_sleep / 1_000_000)
     
-    def handle_client_connection(self, client_addr: Tuple[str, int], data: bytes):
-        """Handle new client connection and heartbeat messages"""
-        # Check if this is a heartbeat message
-        if data.startswith(b"HEARTBEAT:"):
-            # Extract timestamp and echo back with server timestamp
-            client_timestamp = struct.unpack('d', data[10:])[0]
+    def handle_heartbeat_message(self, client_addr: Tuple[str, int], data: bytes):
+        """Handle heartbeat MessagePacket messages and reply on receiving socket."""
+        try:
+            mt, data_channel, channel_seq, seq_offset, json_obj = MessagePacket.parse_packet(data)
+        except Exception:
+            return
+
+        # HEARTBEAT_0: server should reply with HEARTBEAT_1 containing timestamps
+        if mt == MessageType.HEARTBEAT_0:
+            client_timestamp = None
+            if isinstance(json_obj, dict):
+                client_timestamp = json_obj.get('timestamp')
+
             server_time = time.time()
-            
-            # Calculate server-side latency (half round-trip from previous exchange)
-            response = b"HEARTBEAT_ECHO:" + struct.pack('dd', client_timestamp, server_time)
-            self.main_socket.sendto(response, client_addr)
+            # mark the last receiving socket so handler can reply on the same socket
+            try:
+                self._last_recv_sock = self.main_socket
+            except Exception:
+                self._last_recv_sock = None
+            resp_json = {'client_timestamp': client_timestamp, 'server_timestamp': server_time}
+            resp = MessagePacket.format_packet(MessageType.HEARTBEAT_1, data_channel, channel_seq, seq_offset, resp_json)
+            # send reply on the socket that received it (src_sock) or fallback to main_socket
+            out_sock = getattr(self, 'main_socket', None)
+            try:
+                # if caller provided a src_sock (set as attribute before calling), use it
+                if hasattr(self, '_last_recv_sock') and self._last_recv_sock is not None:
+                    out_sock = self._last_recv_sock
+            except Exception:
+                pass
+
+            try:
+                out_sock.sendto(resp, client_addr)
+            except Exception:
+                pass
             return
-        
-        if data.startswith(b"HEARTBEAT_FINAL:"):
-            # Final echo from client - calculate latency
-            client_timestamp, server_timestamp = struct.unpack('dd', data[16:])
+
+        # HEARTBEAT_2: final echo from client - calculate latency at server
+        if mt == MessageType.HEARTBEAT_2:
+            client_timestamp = None
+            server_timestamp = None
+            if isinstance(json_obj, dict):
+                client_timestamp = json_obj.get('client_timestamp')
+                server_timestamp = json_obj.get('server_timestamp')
+
             current_time = time.time()
-            latency = (current_time - server_timestamp) * 1000  # Convert to milliseconds
-            print(f"Server latency to {client_addr[0]}:{client_addr[1]}: {latency:.2f} ms", file=sys.stderr)
-            sys.stderr.flush()
+            if server_timestamp is not None:
+                latency = (current_time - server_timestamp) * 1000  # ms
+                print(f"Server latency (MAIN) to {client_addr[0]}:{client_addr[1]}: {latency:.2f} ms", file=sys.stderr)
+                sys.stderr.flush()
+                # record
+                try:
+                    self.record_latency('MAIN', latency)
+                except Exception:
+                    pass
             return
-        
-        if client_addr not in self.client_connections:
-            # Allocate three ports for this client
-            ports = self.port_manager.allocate_ports(3)
-            
-            if ports is None:
-                print(f"Failed to allocate ports for client {client_addr}", file=sys.stderr)
-                return
-            
-            control_port, upload_port, download_port = ports
-            self.client_connections[client_addr] = (control_port, upload_port, download_port)
-            
-            print(f"Client connected: {client_addr[0]}:{client_addr[1]}")
-            print(f"  Control Port: {control_port}")
-            print(f"  Upload Port: {upload_port}")
-            print(f"  Download Port: {download_port}")
-            sys.stdout.flush()
-            
-            # Create sockets for this client's ports
-            self.setup_client_sockets(control_port, upload_port, download_port)
-        
-        # Send port information back to client
-        ports = self.client_connections[client_addr]
-        response = f"{ports[0]},{ports[1]},{ports[2]}".encode()
-        self.main_socket.sendto(response, client_addr)
-    
-    def setup_client_sockets(self, control_port: int, upload_port: int, download_port: int):
-        """Setup sockets for client ports"""
-        for port in [control_port, upload_port, download_port]:
-            if port not in self.client_sockets:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.bind((self.config.bind_addr, port))
-                sock.setblocking(False)
-                self.client_sockets[port] = sock
     
     def stop(self):
         """Stop the server"""
         self.running = False
         if self.main_socket:
             self.main_socket.close()
-        for sock in self.client_sockets.values():
-            sock.close()
+        for client_comms in self.client_connections.values():
+            client_comms.close()
 
 
 class WyndClient:
@@ -464,6 +809,30 @@ class WyndClient:
         self.heartbeat_interval = 5.0  # seconds
         self.last_heartbeat = 0
         self.block_time = block_time  # milliseconds
+        self.heartbeat_key = None  # Will be set after connecting
+        # client-side latency stats
+        self._latency_stats = {
+            'MAIN': {'sum': 0.0, 'count': 0},
+            'CONTROL': {'sum': 0.0, 'count': 0},
+            'UPLOAD': {'sum': 0.0, 'count': 0},
+            'DOWNLOAD': {'sum': 0.0, 'count': 0},
+        }
+
+    def record_latency(self, port_label: str, latency_ms: float):
+        label = port_label.upper()
+        if label not in self._latency_stats:
+            self._latency_stats[label] = {'sum': 0.0, 'count': 0}
+        self._latency_stats[label]['sum'] += float(latency_ms)
+        self._latency_stats[label]['count'] += 1
+
+    def print_latency_summary(self):
+        print("\nClient latency summary:")
+        for label, data in self._latency_stats.items():
+            if data['count'] > 0:
+                avg = data['sum'] / data['count']
+                print(f"  {label}: avg={avg:.2f} ms over {int(data['count'])} samples")
+            else:
+                print(f"  {label}: no samples")
     
     def start(self):
         """Start the client and connect to server"""
@@ -481,24 +850,43 @@ class WyndClient:
         # Wait for port assignment
         self.main_socket.settimeout(5.0)
         try:
+            
+            # Parse response: "port1,port2,port3,heartbeat_key"
             data, _ = self.main_socket.recvfrom(4096)
             ports_str = data.decode()
-            control_port, upload_port, download_port = map(int, ports_str.split(','))
+            self.control_port, self.upload_port, self.download_port, self.heartbeat_key = map(int, ports_str.split(','))
             
             print(f"Received port assignment:")
-            print(f"  Control Port: {control_port}")
-            print(f"  Upload Port: {upload_port}")
-            print(f"  Download Port: {download_port}")
+            print(f"  Control Port: {self.control_port}")
+            print(f"  Upload Port: {self.upload_port}")
+            print(f"  Download Port: {self.download_port}")       
+            print(f"  Heartbeat Key: {self.heartbeat_key}")
             
             # Create sockets for each port
             self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.upload_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.download_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            
-            # Send heartbeat to each port
-            self.control_socket.sendto(b"HEARTBEAT", (self.server_addr, control_port))
-            self.upload_socket.sendto(b"HEARTBEAT", (self.server_addr, upload_port))
-            self.download_socket.sendto(b"HEARTBEAT", (self.server_addr, download_port))
+
+            # Set per-port socket timeouts/blocking consistent with main socket
+            if self.block_time > 0:
+                per_timeout = self.block_time / 1000
+                self.control_socket.settimeout(per_timeout)
+                self.upload_socket.settimeout(per_timeout)
+                self.download_socket.settimeout(per_timeout)
+            else:
+                self.control_socket.setblocking(False)
+                self.upload_socket.setblocking(False)
+                self.download_socket.setblocking(False)
+
+            # Send formatted HEARTBEAT_0 to each assigned server port (data_channel: 0=CONTROL,1=UPLOAD,2=DOWNLOAD)
+            ts = time.time()
+            msg_ctrl = MessagePacket.format_packet(MessageType.HEARTBEAT_0, 0, 0, 0, {'timestamp': ts})
+            msg_up = MessagePacket.format_packet(MessageType.HEARTBEAT_0, 1, 0, 0, {'timestamp': ts})
+            msg_down = MessagePacket.format_packet(MessageType.HEARTBEAT_0, 2, 0, 0, {'timestamp': ts})
+
+            self.control_socket.sendto(msg_ctrl, (self.server_addr, self.control_port))
+            self.upload_socket.sendto(msg_up, (self.server_addr, self.upload_port))
+            self.download_socket.sendto(msg_down, (self.server_addr, self.download_port))
             
             print("Client connected successfully")
             sys.stdout.flush()
@@ -535,31 +923,70 @@ class WyndClient:
                 self.send_heartbeat()
                 self.last_heartbeat = current_time
             
-            # Check for heartbeat responses (blocks up to 0.1 seconds)
-            try:
-                data, _ = self.main_socket.recvfrom(4096)
-                if data.startswith(b"HEARTBEAT_ECHO:") and len(data) >= 31:
-                    client_timestamp, server_timestamp = struct.unpack('dd', data[15:])
-                    current_time = time.time()
-                    
-                    # Calculate round-trip latency
-                    latency = (current_time - client_timestamp) * 1000  # milliseconds
-                    print(f"Client latency: {latency:.2f} ms", file=sys.stderr)
-                    sys.stderr.flush()
-                    
-                    # Send final echo back to server
-                    final_echo = b"HEARTBEAT_FINAL:" + struct.pack('dd', client_timestamp, server_timestamp)
-                    self.main_socket.sendto(final_echo, (self.server_addr, self.server_port))
-            except socket.timeout:
-                pass
-            except Exception as e:
-                print(f"Error in client comm loop: {e}", file=sys.stderr)
+            # No HEARTBEAT handling on main socket; heartbeats use per-port sockets only.
+
+            # Check per-port sockets for heartbeat responses
+            for sock, label, port in ((self.control_socket, 'CONTROL', self.control_port), (self.upload_socket, 'UPLOAD', self.upload_port), (self.download_socket, 'DOWNLOAD', self.download_port)):
+                if not sock:
+                    continue
+                try:
+                    data, _ = sock.recvfrom(4096)
+                    #print(f"received {len(data)} bytes of packet data on {label} port")
+                except socket.timeout:
+                    continue
+                except Exception:
+                    continue
+
+                try:
+                    mt, data_channel, channel_seq, seq_offset, json_obj = MessagePacket.parse_packet(data)
+                except Exception:
+                    continue
+
+                if mt == MessageType.HEARTBEAT_1:
+                    client_timestamp = None
+                    server_timestamp = None
+                    if isinstance(json_obj, dict):
+                        client_timestamp = json_obj.get('client_timestamp')
+                        server_timestamp = json_obj.get('server_timestamp')
+
+                    now = time.time()
+                    if client_timestamp is not None:
+                        latency = (now - client_timestamp) * 1000
+                        print(f"Client latency ({label}): {latency:.2f} ms", file=sys.stderr)
+                        sys.stderr.flush()
+                        try:
+                            self.record_latency(label, latency)
+                        except Exception:
+                            pass
+
+                    # Send final HEARTBEAT_2 to server main socket
+                    resp_json = {'client_timestamp': client_timestamp, 'server_timestamp': server_timestamp}
+                    resp = MessagePacket.format_packet(MessageType.HEARTBEAT_2, data_channel, channel_seq, seq_offset, resp_json)
+                    sock.sendto(resp, (self.server_addr, port))
     
     def send_heartbeat(self):
         """Send heartbeat with timestamp to server"""
         timestamp = time.time()
-        message = b"HEARTBEAT:" + struct.pack('d', timestamp)
-        self.main_socket.sendto(message, (self.server_addr, self.server_port))
+        json_obj = {'timestamp': timestamp}
+        # Send heartbeats on per-port sockets only (CONTROL=0, UPLOAD=1, DOWNLOAD=2)
+        message_ctrl = MessagePacket.format_packet(MessageType.HEARTBEAT_0, 0, 0, 0, json_obj)
+        message_up = MessagePacket.format_packet(MessageType.HEARTBEAT_0, 1, 0, 0, json_obj)
+        message_down = MessagePacket.format_packet(MessageType.HEARTBEAT_0, 2, 0, 0, json_obj)
+        try:
+            if self.control_socket and self.control_port:
+                self.control_socket.sendto(message_ctrl, (self.server_addr, self.control_port))
+        except Exception:
+            pass
+        try:
+            if self.upload_socket and self.upload_port:
+                self.upload_socket.sendto(message_up, (self.server_addr, self.upload_port))
+        except Exception:
+            pass
+        try:
+            if self.download_socket and self.download_port:
+                self.download_socket.sendto(message_down, (self.server_addr, self.download_port))
+        except Exception:
+            pass
     
     def stop(self):
         """Stop the client"""
@@ -743,6 +1170,10 @@ def main():
                 sys.exit(1)
     
     # Determine mode
+    # If no mode specified, default to client connecting to localhost:6711
+    if args.server is None and not args.client_target:
+        args.client_target = '127.0.0.1:6711'
+
     if args.server is not None:
         # Server mode
         config = ServerConfig()
@@ -767,6 +1198,10 @@ def main():
         except KeyboardInterrupt:
             print("\nShutting down server...")
             server.stop()
+            try:
+                server.print_latency_summary()
+            except Exception:
+                pass
     
     elif args.client_target:
         # Client mode
@@ -780,6 +1215,11 @@ def main():
             block_time = config.client_block_time
         
         client = WyndClient(addr, port, block_time)
+        # Set heartbeat interval from config if present (milliseconds -> seconds)
+        try:
+            client.heartbeat_interval = config.heartbeat_rate / 1000.0
+        except Exception:
+            pass
         
         try:
             client.start()
@@ -789,6 +1229,10 @@ def main():
         except KeyboardInterrupt:
             print("\nShutting down client...")
             client.stop()
+            try:
+                client.print_latency_summary()
+            except Exception:
+                pass
     
     else:
         parser.print_help()
