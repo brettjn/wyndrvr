@@ -5,8 +5,14 @@ A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
 
-__version__ = "0.9"
+__version__ = "0.11"
 __version_notes__ = """
+Version 0.11:
+- Fixed hang when circular buffer becomes full in FLOW_CONTROL processing
+- Changed dropped packet detection to work with span ranges instead of iterating individual sequences
+- Prevents attempting to iterate through billions of sequence numbers in large spans
+- Improves performance and reliability when dealing with dropped packets during bandwidth tests
+
 Version 0.9:
 - Added --test-drop-rate option to simulate packet loss (default: 0)
 - test_drop_rate value is probability (0.0-1.0) that a packet will be dropped
@@ -160,8 +166,12 @@ class MessagePacket:
         header += struct.pack('>Q', int(sequence_offset))
 
         body = json.dumps(json_obj).encode('utf-8') if json_obj is not None else b''
-
-        return header + body
+        
+        packet = header + body
+        if len(packet) > 1400:
+            raise ValueError(f'Packet exceeds maximum size of 1400 bytes: {len(packet)} bytes')
+        
+        return packet
 
     @classmethod
     def format_binary_packet(cls, msg_type, data_channel: int, channel_sequence_number: int, sequence_offset: int, binary_data: bytes) -> bytes:
@@ -175,8 +185,12 @@ class MessagePacket:
         header += struct.pack('>Q', int(channel_sequence_number))
         # 8 bytes sequence_offset
         header += struct.pack('>Q', int(sequence_offset))
-
-        return header + binary_data
+        
+        packet = header + binary_data
+        if len(packet) > 1400:
+            raise ValueError(f'Packet exceeds maximum size of 1400 bytes: {len(packet)} bytes')
+        
+        return packet
 
     @classmethod
     def parse_packet(cls, data: bytes):
@@ -232,12 +246,17 @@ class SequenceSpan:
     """Represents a list of sequence number spans (beginning and ending pairs)"""
     
     def __init__(self, spans: Optional[List[Tuple[int, int]]] = None):
-        """Initialize with list of (begin, end) tuples or default to full 8-byte span"""
+        """Initialize with list of (begin, end) tuples or default to full 8-byte span
+        
+        Spans are automatically sorted by their begin value to ensure lowest sequences
+        are at the front of the list.
+        """
         if spans is None:
             # Default to complete 8-byte span: 0 to 2^64 - 1
             self.spans = [(0, (2**64) - 1)]
         else:
-            self.spans = spans
+            # Sort spans by begin value to maintain numerical order
+            self.spans = sorted(spans, key=lambda x: x[0])
     
     def get_spans(self) -> List[Tuple[int, int]]:
         """Return the list of spans"""
@@ -301,6 +320,44 @@ class SequenceSpan:
             self.spans[min_idx] = (begin + 1, end)
         
         return lowest
+    
+    def remove_seq(self, seq_num: int) -> bool:
+        """Remove a specific sequence number from the spans
+        
+        If the sequence number is in the middle of a span, split it into two spans.
+        For example, removing 8 from span (5, 100) results in spans (5, 7) and (9, 100).
+        
+        Args:
+            seq_num: The sequence number to remove
+            
+        Returns:
+            True if the sequence number was found and removed, False otherwise
+        """
+        # Find which span contains this sequence number
+        for i, (begin, end) in enumerate(self.spans):
+            if begin <= seq_num <= end:
+                # Found the span containing this sequence number
+                
+                if begin == end:
+                    # Span contains only this one number, remove the entire span
+                    self.spans.pop(i)
+                elif seq_num == begin:
+                    # Removing from the beginning, just increment begin
+                    self.spans[i] = (begin + 1, end)
+                elif seq_num == end:
+                    # Removing from the end, just decrement end
+                    self.spans[i] = (begin, end - 1)
+                else:
+                    # Removing from the middle, split into two spans
+                    # First span: from begin to seq_num-1
+                    # Second span: from seq_num+1 to end
+                    self.spans[i] = (begin, seq_num - 1)
+                    self.spans.insert(i + 1, (seq_num + 1, end))
+                
+                return True
+        
+        # Sequence number not found in any span
+        return False
 
 
 class UploadDataSink:
@@ -648,8 +705,19 @@ class ServerClientComms:
         if mt == MessageType.BANDWIDTH_TEST and port_type == PortType.UPLOAD:
             # Check if we have an active upload data sink for this channel
             if data_channel in self.upload_data_sinks:
+                # Calculate the actual sequence number (channel_sequence_number - sequence_offset)
+                actual_seq_num = channel_sequence_number - sequence_offset
+                
+                # Remove the actual sequence number from the sequence span
+                sink = self.upload_data_sinks[data_channel]
+                if sink.sequence_span:
+                    sink.sequence_span.remove_seq(actual_seq_num)
+                
                 if self.test_verbose:
-                    print(f"Server received BANDWIDTH_TEST packet seq={channel_sequence_number} from {self.client_addr[0]}:{self.client_addr[1]} on channel {data_channel}", file=sys.stderr)
+                    if sequence_offset != 0:
+                        print(f"Server received BANDWIDTH_TEST packet channel_seq={channel_sequence_number}, actual_seq={actual_seq_num}, offset={sequence_offset} from {self.client_addr[0]}:{self.client_addr[1]} on channel {data_channel}", file=sys.stderr)
+                    else:
+                        print(f"Server received BANDWIDTH_TEST packet seq={channel_sequence_number} from {self.client_addr[0]}:{self.client_addr[1]} on channel {data_channel}", file=sys.stderr)
                     sys.stderr.flush()
 
         return True
@@ -744,9 +812,14 @@ class ServerClientComms:
             # Send if enough time has passed
             if time_since_last >= resend_interval_ms:
                 try:
-                    # Get binary representation of sequence spans
+                    # Get binary representation of sequence spans, limiting to 1380 bytes
                     if sink.sequence_span:
-                        binary_data = sink.sequence_span.to_binary()
+                        # Each span is 16 bytes, plus 4 bytes for count
+                        # Max 1380 bytes: (1380 - 4) / 16 = 86 spans
+                        max_spans = 86
+                        spans_to_send = sink.sequence_span.spans[:max_spans]
+                        limited_span = SequenceSpan(spans_to_send)
+                        binary_data = limited_span.to_binary()
                     else:
                         binary_data = b''
                     
@@ -1297,18 +1370,31 @@ class WyndClient:
         print(f"Connecting to server {self.server_addr}:{self.server_port}")
         sys.stdout.flush()
         
-        # Send initial connection request
-        if not self.should_drop_packet():
-            self.main_socket.sendto(b"CONNECT", (self.server_addr, self.server_port))
-        
-        # Wait for port assignment
-        self.main_socket.settimeout(5.0)
-        try:
+        # Wait for port assignment with retry loop
+        self.main_socket.settimeout(1.0)
+        connected = False
+        for attempt in range(5):
+            # Send connection request
+            if not self.should_drop_packet():
+                self.main_socket.sendto(b"CONNECT", (self.server_addr, self.server_port))
             
-            # Parse response: "port1,port2,port3,heartbeat_key"
-            data, _ = self.main_socket.recvfrom(4096)
-            ports_str = data.decode()
-            self.control_port, self.upload_port, self.download_port, self.heartbeat_key = map(int, ports_str.split(','))
+            try:
+                # Parse response: "port1,port2,port3,heartbeat_key"
+                data, _ = self.main_socket.recvfrom(4096)
+                ports_str = data.decode()
+                self.control_port, self.upload_port, self.download_port, self.heartbeat_key = map(int, ports_str.split(','))
+                connected = True
+                break
+            except socket.timeout:
+                continue
+        
+        if not connected:
+            print("Timeout waiting for server response", file=sys.stderr)
+            sys.stderr.flush()
+            self.running = False
+            return
+        
+        try:
             
             print(f"Received port assignment:")
             print(f"  Control Port: {self.control_port}")
@@ -1361,9 +1447,6 @@ class WyndClient:
             # Run main client communication loop
             self.client_comm_loop()
             
-        except socket.timeout:
-            print("Timeout waiting for server response", file=sys.stderr)
-            self.running = False
         except Exception as e:
             print(f"Error connecting to server: {e}", file=sys.stderr)
             self.running = False
@@ -1426,9 +1509,6 @@ class WyndClient:
                                 sys.stderr.flush()
                     elif mt == MessageType.FLOW_CONTROL and label == 'UPLOAD':
                         # Received FLOW_CONTROL message - decode binary data
-                        if self.test_verbose:
-                            print(f"Client received FLOW_CONTROL on channel {data_channel}", file=sys.stderr)
-                            sys.stderr.flush()
                         
                         # Parse binary payload to create SequenceSpan
                         try:
@@ -1437,6 +1517,38 @@ class WyndClient:
                             if binary_data:
                                 # Create SequenceSpan from binary data
                                 sequence_span = SequenceSpan.from_binary(binary_data)
+                                
+                                if self.test_verbose:
+                                    print(f"Client received FLOW_CONTROL on channel {data_channel}, spans: {sequence_span.spans}", file=sys.stderr)
+                                    sys.stderr.flush()
+                                
+                                # Check if buffer is full - if so, compare oldest with new to find dropped packets
+                                if len(self.flow_control_buffer) == self.flow_control_buffer.maxlen:
+                                    # Get the oldest span (will be evicted when we append)
+                                    oldest_span = self.flow_control_buffer[0]
+                                    
+                                    # Find sequence spans that exist in both old and new spans (dropped packets)
+                                    # These are sequences the server still expects but we haven't sent
+                                    dropped_span_ranges = []
+                                    for old_begin, old_end in oldest_span.spans:
+                                        for new_begin, new_end in sequence_span.spans:
+                                            # Find overlap between spans
+                                            overlap_begin = max(old_begin, new_begin)
+                                            overlap_end = min(old_end, new_end)
+                                            if overlap_begin <= overlap_end:
+                                                # Add the overlap as a span range (don't iterate!)
+                                                dropped_span_ranges.append((overlap_begin, overlap_end))
+                                    
+                                    # Add dropped span ranges to working_sequence_span for retransmission
+                                    if dropped_span_ranges and self.working_sequence_span:
+                                        # Add spans directly to working sequence span
+                                        self.working_sequence_span.spans.extend(dropped_span_ranges)
+                                        # Re-sort spans to maintain order
+                                        self.working_sequence_span.spans.sort(key=lambda x: x[0])
+                                        
+                                        if self.test_verbose:
+                                            print(f"Client detected {len(dropped_span_ranges)} dropped span ranges, added to working span", file=sys.stderr)
+                                            sys.stderr.flush()
                                 
                                 # Add to circular buffer
                                 self.flow_control_buffer.append(sequence_span)
@@ -1451,8 +1563,10 @@ class WyndClient:
                             if self.test_verbose:
                                 print(f"Error decoding FLOW_CONTROL binary data: {e}", file=sys.stderr)
                                 sys.stderr.flush()
+                    # Continue to next packet after handling CONTROL/FLOW_CONTROL
                     continue
 
+                # Handle heartbeat messages
                 if mt == MessageType.HEARTBEAT_1:
                     client_timestamp = None
                     server_timestamp = None
@@ -1516,20 +1630,29 @@ class WyndClient:
         json_payload = {'dummy_data': dummy_data}
 
         for _ in range(packets_per_iteration):
-            # Get next sequence number
-            seq_num = self.working_sequence_span.get_lowest()
-            if seq_num is None:
+            # Get the actual channel sequence number (incrementing counter)
+            channel_seq_num = self.get_and_increment_sequence(self.upload_port, self.bwup_channel)
+            
+            # Get expected sequence number from working span
+            expected_seq_num = self.working_sequence_span.get_lowest()
+            if expected_seq_num is None:
                 # No more sequence numbers available
                 break
             
+            # Calculate sequence_offset if we're retransmitting
+            if channel_seq_num != expected_seq_num:
+                seq_offset = channel_seq_num - expected_seq_num
+            else:
+                seq_offset = 0
+            
             try:
                 
-                # Create BANDWIDTH_TEST packet
+                # Create BANDWIDTH_TEST packet with sequence_offset
                 message = MessagePacket.format_packet(
                     MessageType.BANDWIDTH_TEST,
                     self.bwup_channel,
-                    seq_num,
-                    0,
+                    channel_seq_num,
+                    seq_offset,
                     json_payload
                 )
                 
@@ -1539,7 +1662,10 @@ class WyndClient:
                 
                 # Verbose logging
                 if self.test_verbose:
-                    print(f"Client sent BANDWIDTH_TEST packet seq={seq_num} on channel {self.bwup_channel}", file=sys.stderr)
+                    if seq_offset != 0:
+                        print(f"Client sent BANDWIDTH_TEST packet channel_seq={channel_seq_num}, expected_seq={expected_seq_num}, offset={seq_offset} on channel {self.bwup_channel}", file=sys.stderr)
+                    else:
+                        print(f"Client sent BANDWIDTH_TEST packet seq={channel_seq_num} on channel {self.bwup_channel}", file=sys.stderr)
                     sys.stderr.flush()
                 
             except Exception as e:

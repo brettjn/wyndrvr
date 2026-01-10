@@ -56,6 +56,50 @@ def test_sequence_span_get_lowest():
     print("SequenceSpan.get_lowest() tests passed!")
 
 
+def test_sequence_span_remove_seq():
+    """Test SequenceSpan.remove_seq() method"""
+    
+    # Test removing from middle of span
+    span = SequenceSpan(spans=[(5, 100)])
+    assert span.remove_seq(8) == True
+    assert span.spans == [(5, 7), (9, 100)]
+    
+    # Test removing from beginning of span
+    span2 = SequenceSpan(spans=[(10, 20)])
+    assert span2.remove_seq(10) == True
+    assert span2.spans == [(11, 20)]
+    
+    # Test removing from end of span
+    span3 = SequenceSpan(spans=[(10, 20)])
+    assert span3.remove_seq(20) == True
+    assert span3.spans == [(10, 19)]
+    
+    # Test removing single element span
+    span4 = SequenceSpan(spans=[(15, 15)])
+    assert span4.remove_seq(15) == True
+    assert span4.spans == []
+    
+    # Test removing non-existent number
+    span5 = SequenceSpan(spans=[(10, 20)])
+    assert span5.remove_seq(25) == False
+    assert span5.spans == [(10, 20)]  # Unchanged
+    
+    # Test with multiple spans
+    span6 = SequenceSpan(spans=[(10, 20), (30, 40), (50, 60)])
+    assert span6.remove_seq(35) == True
+    assert span6.spans == [(10, 20), (30, 34), (36, 40), (50, 60)]
+    
+    # Test removing from first span in multiple spans
+    assert span6.remove_seq(15) == True
+    assert span6.spans == [(10, 14), (16, 20), (30, 34), (36, 40), (50, 60)]
+    
+    # Test removing from last span in multiple spans
+    assert span6.remove_seq(55) == True
+    assert span6.spans == [(10, 14), (16, 20), (30, 34), (36, 40), (50, 54), (56, 60)]
+    
+    print("SequenceSpan.remove_seq() tests passed!")
+
+
 def test_bandwidth_packet_format():
     """Test BANDWIDTH_TEST packet format"""
     
