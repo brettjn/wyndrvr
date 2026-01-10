@@ -5,8 +5,20 @@ A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
 
-__version__ = "0.7"
+__version__ = "0.8"
 __version_notes__ = """
+Version 0.8:
+- Implemented BANDWIDTH_TEST packet generation and sending
+- Added SequenceSpan.get_lowest() method to retrieve and remove lowest sequence number
+- Client continuously sends BANDWIDTH_TEST packets during 30-second upload test
+- Packets sent at ~10 per iteration without blocking other communication
+- Added bw_packet_length configuration parameter (default 900 bytes)
+- BANDWIDTH_TEST packets include dummy_data payload of configurable length
+- Dummy data consists of alphabet, numbers, and ASCII symbols repeated to target length
+- Automatic test timeout after 30 seconds with cleanup
+- Non-blocking design maintains heartbeat and control message responsiveness
+- Unit tests for SequenceSpan.get_lowest() and packet format validation
+
 Version 0.7:
 - Added --bwup flag to initiate upload bandwidth test (30 seconds)
 - Added --test-verbose flag to enable debug output for control/flow messages
@@ -18,7 +30,7 @@ Version 0.7:
 - Changed adjustment_delay from microseconds to milliseconds in config
 - Added ucm_delay config setting (default 100ms) for control message retransmission
 - Client automatically resends BWUP if not acknowledged within ucm_delay
-- Integration tests for BWUP and FLOW_CONTROL functionality
+- Client decodes FLOW_CONTROL packets and stores SequenceSpans in circular buffer
 
 Version 0.6:
 - Added PortType enum for type-safe port type handling (CONTROL, UPLOAD, DOWNLOAD)
@@ -228,6 +240,56 @@ class SequenceSpan:
         for begin, end in self.spans:
             result += struct.pack('>QQ', begin, end)  # Two 8-byte unsigned long longs
         return result
+    
+    @classmethod
+    def from_binary(cls, binary_data: bytes) -> 'SequenceSpan':
+        """Create SequenceSpan from binary representation"""
+        if len(binary_data) < 4:
+            raise ValueError('Binary data too short for SequenceSpan')
+        
+        # Read span count (4 bytes)
+        span_count = struct.unpack('>I', binary_data[0:4])[0]
+        
+        # Each span is 16 bytes (two 8-byte unsigned long longs)
+        expected_len = 4 + (span_count * 16)
+        if len(binary_data) < expected_len:
+            raise ValueError(f'Binary data too short: expected {expected_len}, got {len(binary_data)}')
+        
+        spans = []
+        offset = 4
+        for i in range(span_count):
+            begin, end = struct.unpack('>QQ', binary_data[offset:offset+16])
+            spans.append((begin, end))
+            offset += 16
+        
+        return cls(spans)
+    
+    def get_lowest(self) -> Optional[int]:
+        """Get and remove the lowest sequence number from spans"""
+        if not self.spans or len(self.spans) == 0:
+            return None
+        
+        # Find the span with the lowest begin value
+        min_idx = 0
+        min_begin = self.spans[0][0]
+        for i in range(1, len(self.spans)):
+            if self.spans[i][0] < min_begin:
+                min_begin = self.spans[i][0]
+                min_idx = i
+        
+        # Get the lowest value
+        begin, end = self.spans[min_idx]
+        lowest = begin
+        
+        # Update the span
+        if begin == end:
+            # Remove this span entirely
+            self.spans.pop(min_idx)
+        else:
+            # Increment the begin value
+            self.spans[min_idx] = (begin + 1, end)
+        
+        return lowest
 
 
 class UploadDataSink:
@@ -273,6 +335,7 @@ class ServerConfig:
     client_block_time: int = 100  # milliseconds
     ucm_delay: int = 100  # milliseconds (upload control message delay)
     test_verbose: bool = False  # Print test/debug messages
+    bw_packet_length: int = 900  # bytes (bandwidth test packet payload length)
     
     def __post_init__(self):
         if self.port_ranges is None:
@@ -751,6 +814,12 @@ class WyndServer:
                             config.server_block_time = int(value)
                         elif key == 'client_block_time':
                             config.client_block_time = int(value)
+                        elif key == 'ucm_delay':
+                            config.ucm_delay = int(value)
+                        elif key == 'test_verbose':
+                            config.test_verbose = value.lower() in ('true', '1', 'yes')
+                        elif key == 'bw_packet_length':
+                            config.bw_packet_length = int(value)
         except Exception as e:
             print(f"Error loading config: {e}", file=sys.stderr)
         
@@ -790,6 +859,12 @@ flow_control_rate=3
 # Socket blocking times (milliseconds)
 server_block_time=10
 client_block_time=10
+
+# Upload control message delay (milliseconds)
+ucm_delay=100
+
+# Bandwidth test packet length (bytes)
+bw_packet_length=900
 """
         
         try:
@@ -1121,6 +1196,17 @@ class WyndClient:
         self.bwup_acked = False  # Whether BWUP has been acknowledged
         self.ucm_delay = 100  # milliseconds (will be loaded from config if available)
         self.test_verbose = test_verbose  # Print test/debug messages
+        self.flow_control_rate = 3  # Will be loaded from config if available
+        self.bw_packet_length = 900  # bytes (will be loaded from config if available)
+        self.bw_test_start_time = None  # Timestamp when bandwidth test started
+        self.bw_test_duration = 30.0  # seconds
+        # Circular buffer for FLOW_CONTROL SequenceSpans
+        from collections import deque
+        self.flow_control_buffer = deque(maxlen=self.flow_control_rate)
+        self.working_sequence_span = None  # Current working SequenceSpan
+        # Generate dummy data for bandwidth test packets
+        alphabet_nums_symbols = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?/~`'
+        self.dummy_data_base = alphabet_nums_symbols
         # Sequence tracking: key is (port, data_channel), value is sequence number
         self._sequences = {}
         # client-side latency stats
@@ -1284,14 +1370,37 @@ class WyndClient:
                         if cmd == 'BWUP' and json_obj.get('ack') == 0:
                             # Received CONTROL ack for BWUP
                             self.bwup_acked = True
+                            self.bw_test_start_time = time.time()  # Start the bandwidth test timer
                             if self.test_verbose:
-                                print(f"Client received BWUP ack from server", file=sys.stderr)
+                                print(f"Client received BWUP ack from server, starting bandwidth test", file=sys.stderr)
                                 sys.stderr.flush()
                     elif mt == MessageType.FLOW_CONTROL and label == 'UPLOAD':
-                        # Received FLOW_CONTROL message
+                        # Received FLOW_CONTROL message - decode binary data
                         if self.test_verbose:
                             print(f"Client received FLOW_CONTROL on channel {data_channel}", file=sys.stderr)
                             sys.stderr.flush()
+                        
+                        # Parse binary payload to create SequenceSpan
+                        try:
+                            # Get binary data from packet (everything after 20-byte header)
+                            binary_data = data[MessagePacket.HEADER_LEN:]
+                            if binary_data:
+                                # Create SequenceSpan from binary data
+                                sequence_span = SequenceSpan.from_binary(binary_data)
+                                
+                                # Add to circular buffer
+                                self.flow_control_buffer.append(sequence_span)
+                                
+                                # Set as working_sequence_span if None
+                                if self.working_sequence_span is None:
+                                    self.working_sequence_span = sequence_span
+                                    if self.test_verbose:
+                                        print(f"Client set working_sequence_span from FLOW_CONTROL", file=sys.stderr)
+                                        sys.stderr.flush()
+                        except Exception as e:
+                            if self.test_verbose:
+                                print(f"Error decoding FLOW_CONTROL binary data: {e}", file=sys.stderr)
+                                sys.stderr.flush()
                     continue
 
                 if mt == MessageType.HEARTBEAT_1:
@@ -1316,6 +1425,66 @@ class WyndClient:
                     resp_seq = self.get_and_increment_sequence(port, data_channel)
                     resp = MessagePacket.format_packet(MessageType.HEARTBEAT_2, data_channel, resp_seq, seq_offset, resp_json)
                     sock.sendto(resp, (self.server_addr, port))
+            
+            # Send bandwidth test packets if in test mode
+            self.send_bandwidth_test_packets()
+    
+    def send_bandwidth_test_packets(self):
+        """Send bandwidth test packets if in test mode and have working_sequence_span"""
+        # Check if we're in bandwidth test mode
+        if not self.bw_test_start_time:
+            return
+        
+        # Check if test has expired (30 seconds)
+        current_time = time.time()
+        elapsed = current_time - self.bw_test_start_time
+        if elapsed >= self.bw_test_duration:
+            self.bw_test_start_time = None  # End the test
+            if self.test_verbose:
+                print(f"Client bandwidth test completed (30 seconds)", file=sys.stderr)
+                sys.stderr.flush()
+            return
+        
+        # Check if we have a working sequence span and the channel
+        if not self.working_sequence_span or not self.bwup_channel:
+            return
+        
+        # Send packets without blocking - send as many as we can in this iteration
+        # Typically send a few packets per iteration to maintain throughput
+        packets_per_iteration = 10
+        
+        for _ in range(packets_per_iteration):
+            # Get next sequence number
+            seq_num = self.working_sequence_span.get_lowest()
+            if seq_num is None:
+                # No more sequence numbers available
+                break
+            
+            try:
+                # Generate dummy data to target length
+                repeats_needed = (self.bw_packet_length + len(self.dummy_data_base) - 1) // len(self.dummy_data_base)
+                dummy_data = (self.dummy_data_base * repeats_needed)[:self.bw_packet_length]
+                
+                # Create JSON payload
+                json_payload = {'dummy_data': dummy_data}
+                
+                # Create BANDWIDTH_TEST packet
+                message = MessagePacket.format_packet(
+                    MessageType.BANDWIDTH_TEST,
+                    self.bwup_channel,
+                    seq_num,
+                    0,
+                    json_payload
+                )
+                
+                # Send on upload port
+                self.upload_socket.sendto(message, (self.server_addr, self.upload_port))
+                
+            except Exception as e:
+                if self.test_verbose:
+                    print(f"Error sending bandwidth test packet: {e}", file=sys.stderr)
+                    sys.stderr.flush()
+                break
     
     def send_heartbeat(self):
         """Send heartbeat with timestamp to server"""
@@ -1625,6 +1794,11 @@ def main():
             if config:
                 client.heartbeat_interval = config.heartbeat_rate / 1000.0
                 client.ucm_delay = config.ucm_delay
+                client.flow_control_rate = config.flow_control_rate
+                client.bw_packet_length = config.bw_packet_length
+                # Update circular buffer maxlen if flow_control_rate changed
+                from collections import deque
+                client.flow_control_buffer = deque(client.flow_control_buffer, maxlen=client.flow_control_rate)
         except Exception:
             pass
         
