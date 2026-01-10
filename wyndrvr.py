@@ -5,9 +5,24 @@ A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
 
-__version__ = "0.11"
+__version__ = "0.12"
 __version_notes__ = """
+Version 0.12:
+- Fixed duplicate sequence number transmission bug in client bandwidth test
+- Added span merging logic after detecting dropped packets in FLOW_CONTROL handler
+- Prevents duplicate (begin, end) tuples in working_sequence_span that caused same sequences to be sent repeatedly
+- Merging algorithm sorts spans and combines overlapping/adjacent ranges (begin <= previous_end + 1)
+- Ensures get_lowest() returns unique sequence numbers for proper bandwidth test operation
+
 Version 0.11:
+- Added TEST_RESULT message type (MessageType.TEST_RESULT = 7)
+- Server tracks bytes received and retransmit count during bandwidth tests
+- After 30 seconds, server sends TEST_RESULT with upload statistics to client
+- TEST_RESULT includes: bandwidth (bps), bytes received, retransmit count, duration
+- Client acknowledges TEST_RESULT and continues acking for 5 seconds
+- Client prints upload statistics and shuts down after 5 seconds
+- Server closes client connection after receiving TEST_RESULT ack
+- Uses GUID-based acknowledgment protocol with 100ms retransmission intervals
 - Fixed hang when circular buffer becomes full in FLOW_CONTROL processing
 - Changed dropped packet detection to work with span ranges instead of iterating individual sequences
 - Prevents attempting to iterate through billions of sequence numbers in large spans
@@ -126,6 +141,7 @@ class MessageType(Enum):
     BANDWIDTH_TEST = 4
     DATA           = 5
     CONTROL        = 6
+    TEST_RESULT    = 7
 
 
 class PortType(Enum):
@@ -370,6 +386,8 @@ class UploadDataSink:
         self.created_at = time.time()
         self.sequence_span = None
         self.last_flow_control_sent = 0.0  # Timestamp of last FLOW_CONTROL send
+        self.bytes_received = 0  # Total bytes received on this channel
+        self.retransmit_count = 0  # Count of retransmitted packets (sequence_offset > 0)
         
         # For BANDWIDTH type, create a SequenceSpan with default 8-byte span
         if uds_type == UDS_Type.BANDWIDTH:
@@ -701,6 +719,31 @@ class ServerClientComms:
                         print(f"Server received BWUP packet from {self.client_addr[0]}:{self.client_addr[1]} on channel {channel_from_client}, created UCM {uid}", file=sys.stderr)
                         sys.stderr.flush()
         
+        # Handle TEST_RESULT messages (ack from client)
+        if mt == MessageType.TEST_RESULT and port_type == PortType.CONTROL:
+            if isinstance(json_obj, dict):
+                guid = json_obj.get('guid')
+                ack = json_obj.get('ack')
+                if guid and ack == 0:
+                    # Client is acknowledging our TEST_RESULT, remove UCM and close connection
+                    uid_to_remove = None
+                    for uid, ucm in self.upload_control_messages.items():
+                        if ucm.get_params().get('guid') == guid:
+                            uid_to_remove = uid
+                            break
+                    
+                    if uid_to_remove:
+                        del self.upload_control_messages[uid_to_remove]
+                        if self.test_verbose:
+                            print(f"Server received TEST_RESULT ack from client for guid {guid}, closing connection", file=sys.stderr)
+                            sys.stderr.flush()
+                        
+                        # Close the connection
+                        self.close()
+                        # Mark this client for removal from server's client_connections
+                        if self.server:
+                            self.server.mark_client_for_removal(self.client_addr)
+        
         # Handle BANDWIDTH_TEST messages (upload bandwidth test data)
         if mt == MessageType.BANDWIDTH_TEST and port_type == PortType.UPLOAD:
             # Check if we have an active upload data sink for this channel
@@ -712,6 +755,12 @@ class ServerClientComms:
                 sink = self.upload_data_sinks[data_channel]
                 if sink.sequence_span:
                     sink.sequence_span.remove_seq(actual_seq_num)
+                
+                # Track bytes received (entire packet length)
+                sink.bytes_received += len(data)
+                
+                # Track retransmissions (sequence_offset is the total retransmit count)
+                sink.retransmit_count = sequence_offset
                 
                 if self.test_verbose:
                     if sequence_offset != 0:
@@ -738,7 +787,15 @@ class ServerClientComms:
                 # Use a channel number from the params or generate one
                 channel = params.get('channel', 1)
                 seq = self.get_and_increment_sequence(self.control_port, channel)
-                message = MessagePacket.format_packet(MessageType.CONTROL, channel, seq, 0, params)
+                
+                # Determine message type based on command
+                cmd = params.get('cmd')
+                if cmd == 'TEST_RESULT':
+                    msg_type = MessageType.TEST_RESULT
+                else:
+                    msg_type = MessageType.CONTROL
+                
+                message = MessagePacket.format_packet(msg_type, channel, seq, 0, params)
                 if not self.should_drop_packet():
                     self.control_socket.sendto(message, self.control_client_addr)
                 ucm.last_sent = current_time
@@ -780,6 +837,37 @@ class ServerClientComms:
             elapsed = current_time - self.upload_bandwidth_started
             
             if elapsed >= 30.0:  # 30 seconds
+                # Calculate statistics and send TEST_RESULT for each sink
+                for channel, sink in list(self.upload_data_sinks.items()):
+                    # Calculate upload bandwidth in bits per second
+                    duration = current_time - sink.created_at
+                    if duration > 0:
+                        bandwidth_bps = (sink.bytes_received * 8) / duration
+                    else:
+                        bandwidth_bps = 0
+                    
+                    # Create TEST_RESULT UploadControlMessage with statistics
+                    import uuid
+                    guid = str(uuid.uuid4())
+                    params = {
+                        'cmd': 'TEST_RESULT',
+                        'ack': 1,
+                        'guid': guid,
+                        'channel': channel,
+                        'bytes_received': sink.bytes_received,
+                        'bandwidth_bps': bandwidth_bps,
+                        'retransmit_count': sink.retransmit_count,
+                        'duration': duration
+                    }
+                    
+                    ucm = UploadControlMessage(params)
+                    uid = ucm.get_uid()
+                    self.upload_control_messages[uid] = ucm
+                    
+                    if self.test_verbose:
+                        print(f"Server created TEST_RESULT for channel {channel}: {bandwidth_bps:.2f} bps, {sink.bytes_received} bytes, {sink.retransmit_count} retransmits", file=sys.stderr)
+                        sys.stderr.flush()
+                
                 # Exit upload bandwidth test mode
                 self.upload_bandwidth_started = None
                 
@@ -857,6 +945,7 @@ class WyndServer:
         self.running = False
         self.main_socket = None
         self.client_connections = {}  # client_addr -> ServerClientComms instance
+        self.clients_to_remove = []  # List of client addresses to remove
 
     def print_latency_summary(self):
         """Print latency summary for all clients"""
@@ -866,6 +955,11 @@ class WyndServer:
             return
         for client_addr, client_comms in self.client_connections.items():
             client_comms.print_latency_summary()
+    
+    def mark_client_for_removal(self, client_addr: Tuple[str, int]):
+        """Mark a client for removal from connections"""
+        if client_addr not in self.clients_to_remove:
+            self.clients_to_remove.append(client_addr)
     
     def load_config(self, config_path: Path) -> ServerConfig:
         """Load configuration from file"""
@@ -1217,6 +1311,15 @@ bw_packet_length=900
                 # Check if upload bandwidth test has timed out
                 client_comms.check_upload_bandwidth_timeout()
             
+            # Remove any clients marked for removal
+            for client_addr in self.clients_to_remove:
+                if client_addr in self.client_connections:
+                    del self.client_connections[client_addr]
+                    if self.config.test_verbose:
+                        print(f"Server removed client {client_addr[0]}:{client_addr[1]} from connections", file=sys.stderr)
+                        sys.stderr.flush()
+            self.clients_to_remove.clear()
+            
             # Test delay if configured
             if self.config.test_delay > 0:
                 time.sleep(self.config.test_delay / 1000.0)
@@ -1313,6 +1416,9 @@ class WyndClient:
         self.bw_packet_length = 900  # bytes (will be loaded from config if available)
         self.bw_test_start_time = None  # Timestamp when bandwidth test started
         self.bw_test_duration = 30.0  # seconds
+        self.test_result_received = None  # Timestamp when TEST_RESULT was first received
+        self.test_result_data = None  # Store TEST_RESULT statistics
+        self.test_result_guid = None  # GUID from TEST_RESULT for acking
         # Circular buffer for FLOW_CONTROL SequenceSpans
         from collections import deque
         self.flow_control_buffer = deque(maxlen=self.flow_control_rate)
@@ -1497,8 +1603,32 @@ class WyndClient:
 
                 # Check if this is a heartbeat message (data_channel == heartbeat_key)
                 if data_channel != self.heartbeat_key:
-                    # Not a heartbeat - check for CONTROL and FLOW_CONTROL messages
-                    if mt == MessageType.CONTROL and label == 'CONTROL' and isinstance(json_obj, dict):
+                    # Not a heartbeat - check for CONTROL, FLOW_CONTROL, and TEST_RESULT messages
+                    if mt == MessageType.TEST_RESULT and label == 'CONTROL' and isinstance(json_obj, dict):
+                        # Received TEST_RESULT from server with statistics
+                        guid = json_obj.get('guid')
+                        if guid:
+                            if self.test_result_received is None:
+                                # First time receiving TEST_RESULT
+                                self.test_result_received = time.time()
+                                self.test_result_data = json_obj
+                                self.test_result_guid = guid
+                                
+                                if self.test_verbose:
+                                    print(f"Client received TEST_RESULT: bandwidth={json_obj.get('bandwidth_bps', 0):.2f} bps, bytes={json_obj.get('bytes_received', 0)}, retransmits={json_obj.get('retransmit_count', 0)}", file=sys.stderr)
+                                    sys.stderr.flush()
+                            
+                            # Send ACK back to server
+                            ack_params = {'cmd': 'TEST_RESULT', 'ack': 0, 'guid': guid}
+                            seq = self.get_and_increment_sequence(self.control_port, data_channel)
+                            ack_msg = MessagePacket.format_packet(MessageType.TEST_RESULT, data_channel, seq, 0, ack_params)
+                            if not self.should_drop_packet():
+                                self.control_socket.sendto(ack_msg, (self.server_addr, self.control_port))
+                            
+                            if self.test_verbose:
+                                print(f"Client sent TEST_RESULT ack for guid {guid}", file=sys.stderr)
+                                sys.stderr.flush()
+                    elif mt == MessageType.CONTROL and label == 'CONTROL' and isinstance(json_obj, dict):
                         cmd = json_obj.get('cmd')
                         if cmd == 'BWUP' and json_obj.get('ack') == 0:
                             # Received CONTROL ack for BWUP
@@ -1545,6 +1675,17 @@ class WyndClient:
                                         self.working_sequence_span.spans.extend(dropped_span_ranges)
                                         # Re-sort spans to maintain order
                                         self.working_sequence_span.spans.sort(key=lambda x: x[0])
+                                        
+                                        # Merge overlapping and adjacent spans
+                                        merged_spans = []
+                                        for begin, end in self.working_sequence_span.spans:
+                                            if merged_spans and begin <= merged_spans[-1][1] + 1:
+                                                # Overlapping or adjacent - merge with previous span
+                                                merged_spans[-1] = (merged_spans[-1][0], max(merged_spans[-1][1], end))
+                                            else:
+                                                # Non-overlapping - add as new span
+                                                merged_spans.append((begin, end))
+                                        self.working_sequence_span.spans = merged_spans
                                         
                                         if self.test_verbose:
                                             print(f"Client detected {len(dropped_span_ranges)} dropped span ranges, added to working span", file=sys.stderr)
@@ -1593,6 +1734,29 @@ class WyndClient:
             
             # Send bandwidth test packets if in test mode
             self.send_bandwidth_test_packets()
+            
+            # Check if we should shutdown after receiving TEST_RESULT
+            if self.test_result_received is not None:
+                elapsed = current_time - self.test_result_received
+                if elapsed >= 5.0:  # 5 seconds of acking
+                    # Print statistics and shutdown
+                    if self.test_result_data:
+                        bandwidth_bps = self.test_result_data.get('bandwidth_bps', 0)
+                        bandwidth_mbps = bandwidth_bps / (1024 * 1024)
+                        bytes_received = self.test_result_data.get('bytes_received', 0)
+                        retransmit_count = self.test_result_data.get('retransmit_count', 0)
+                        duration = self.test_result_data.get('duration', 0)
+                        
+                        print(f"\n=== Upload Bandwidth Test Results ===")
+                        print(f"Duration: {duration:.2f} seconds")
+                        print(f"Bytes Received: {bytes_received}")
+                        print(f"Bandwidth: {bandwidth_bps:.2f} bps ({bandwidth_mbps:.2f} Mbps)")
+                        print(f"Retransmitted Packets: {retransmit_count}")
+                        sys.stdout.flush()
+                    
+                    # Stop the client
+                    self.running = False
+                    return
             
             # Test delay if configured
             if self.test_delay > 0:
