@@ -5,21 +5,8 @@ A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
 
-__version__ = "0.7"
+__version__ = "0.6"
 __version_notes__ = """
-Version 0.7:
-- Added --bwup flag to initiate upload bandwidth test (30 seconds)
-- Added --test-verbose flag to enable debug output for control/flow messages
-- Implemented BWUP command with UploadControlMessage acknowledgment system
-- Added UploadDataSink class with SequenceSpan for tracking sequence ranges
-- Server automatically starts/stops bandwidth test mode with 30-second timeout
-- FLOW_CONTROL packets sent every second (adjustment_delay/flow_control_rate)
-- Added MessagePacket.format_binary_packet for binary payloads
-- Changed adjustment_delay from microseconds to milliseconds in config
-- Added ucm_delay config setting (default 100ms) for control message retransmission
-- Client automatically resends BWUP if not acknowledged within ucm_delay
-- Integration tests for BWUP and FLOW_CONTROL functionality
-
 Version 0.6:
 - Added PortType enum for type-safe port type handling (CONTROL, UPLOAD, DOWNLOAD)
 - Heartbeat messages now use heartbeat_key in data_channel field for identification
@@ -72,8 +59,6 @@ import time
 import select
 import struct
 import json
-import random
-import uuid
 from pathlib import Path
 from enum import Enum
 from typing import Optional, Tuple, List, Dict
@@ -90,13 +75,12 @@ class ParallelMode(Enum):
 
 class MessageType(Enum):
     """Message types for packet header"""
-    HEARTBEAT_0    = 0
-    HEARTBEAT_1    = 1
-    HEARTBEAT_2    = 2
-    FLOW_CONTROL   = 3
+    HEARTBEAT_0 = 0
+    HEARTBEAT_1 = 1
+    HEARTBEAT_2 = 2
+    FLOW_CONTROL = 3
     BANDWIDTH_TEST = 4
-    DATA           = 5
-    CONTROL        = 6
+    DATA = 5
 
 
 class PortType(Enum):
@@ -104,11 +88,6 @@ class PortType(Enum):
     CONTROL = "control"
     UPLOAD = "upload"
     DOWNLOAD = "download"
-
-
-class UDS_Type(Enum):
-    """Upload Data Sink types"""
-    BANDWIDTH = 0
 
 
 class MessagePacket:
@@ -141,21 +120,6 @@ class MessagePacket:
         return header + body
 
     @classmethod
-    def format_binary_packet(cls, msg_type, data_channel: int, channel_sequence_number: int, sequence_offset: int, binary_data: bytes) -> bytes:
-        """Format packet with binary data payload instead of JSON"""
-        mt = int(msg_type.value) if isinstance(msg_type, MessageType) else int(msg_type)
-        # 1 byte message type
-        header = bytes([mt])
-        # 3 bytes data_channel
-        header += int(data_channel).to_bytes(3, 'big')
-        # 8 bytes channel_sequence_number
-        header += struct.pack('>Q', int(channel_sequence_number))
-        # 8 bytes sequence_offset
-        header += struct.pack('>Q', int(sequence_offset))
-
-        return header + binary_data
-
-    @classmethod
     def parse_packet(cls, data: bytes):
         if not data or len(data) < cls.HEADER_LEN:
             raise ValueError('Packet too short to parse')
@@ -182,78 +146,6 @@ class MessagePacket:
         return mt, data_channel, channel_sequence_number, sequence_offset, json_obj
 
 
-class UploadControlMessage:
-    """Represents an upload control message with unique identifier"""
-    
-    def __init__(self, params: Dict):
-        """Initialize with dictionary of key-value pairs and add unique identifier"""
-        self.uid = str(uuid.uuid4())
-        self.params = dict(params)
-        self.params['uid'] = self.uid
-        self.last_sent = 0.0  # Timestamp of last send
-    
-    def get_uid(self) -> str:
-        """Return the unique identifier"""
-        return self.uid
-    
-    def get_params(self) -> Dict:
-        """Return the parameters dictionary including uid"""
-        return self.params
-    
-    def should_delete(self) -> bool:
-        """Check if this message should be deleted (ack=0)"""
-        return self.params.get('ack', 1) == 0
-
-
-class SequenceSpan:
-    """Represents a list of sequence number spans (beginning and ending pairs)"""
-    
-    def __init__(self, spans: Optional[List[Tuple[int, int]]] = None):
-        """Initialize with list of (begin, end) tuples or default to full 8-byte span"""
-        if spans is None:
-            # Default to complete 8-byte span: 0 to 2^64 - 1
-            self.spans = [(0, (2**64) - 1)]
-        else:
-            self.spans = spans
-    
-    def get_spans(self) -> List[Tuple[int, int]]:
-        """Return the list of spans"""
-        return self.spans
-    
-    def to_binary(self) -> bytes:
-        """Convert spans to binary representation"""
-        # Each span is two 8-byte unsigned integers (begin, end)
-        # Format: number of spans (4 bytes) followed by span pairs
-        result = struct.pack('>I', len(self.spans))  # 4-byte unsigned int for count
-        for begin, end in self.spans:
-            result += struct.pack('>QQ', begin, end)  # Two 8-byte unsigned long longs
-        return result
-
-
-class UploadDataSink:
-    """Represents an upload data sink for bandwidth testing"""
-    
-    def __init__(self, uds_type: UDS_Type, channel: int):
-        """Initialize with type and channel"""
-        self.uds_type = uds_type
-        self.channel = channel
-        self.created_at = time.time()
-        self.sequence_span = None
-        self.last_flow_control_sent = 0.0  # Timestamp of last FLOW_CONTROL send
-        
-        # For BANDWIDTH type, create a SequenceSpan with default 8-byte span
-        if uds_type == UDS_Type.BANDWIDTH:
-            self.sequence_span = SequenceSpan()
-    
-    def get_type(self) -> UDS_Type:
-        """Return the type"""
-        return self.uds_type
-    
-    def get_channel(self) -> int:
-        """Return the channel"""
-        return self.channel
-
-
 @dataclass
 class ServerConfig:
     """Server configuration settings"""
@@ -267,12 +159,10 @@ class ServerConfig:
     max_send_time: int = 0  # microseconds
     send_sleep: int = 0  # microseconds
     heartbeat_rate: int = 5000  # milliseconds (5 seconds)
-    adjustment_delay: int = 1000  # milliseconds (1 second)
+    adjustment_delay: int = 1000000  # microseconds (1 second)
     flow_control_rate: int = 10  # divider for adjustment_delay
     server_block_time: int = 100  # milliseconds
     client_block_time: int = 100  # milliseconds
-    ucm_delay: int = 100  # milliseconds (upload control message delay)
-    test_verbose: bool = False  # Print test/debug messages
     
     def __post_init__(self):
         if self.port_ranges is None:
@@ -340,18 +230,6 @@ class ServerClientComms:
             'UPLOAD':   {'sum': 0.0, 'count': 0},
             'DOWNLOAD': {'sum': 0.0, 'count': 0},
         }
-        # Upload control messages dictionary: uid -> UploadControlMessage instance
-        self.upload_control_messages: Dict[str, UploadControlMessage] = {}
-        # Upload data sinks dictionary: channel -> UploadDataSink instance
-        self.upload_data_sinks: Dict[int, UploadDataSink] = {}
-        # Upload bandwidth test start timestamp (None when not in test mode)
-        self.upload_bandwidth_started: Optional[float] = None
-        # Client socket addresses (where to send replies)
-        self.control_client_addr = None
-        self.upload_client_addr = None
-        self.download_client_addr = None
-        # Test verbose flag
-        self.test_verbose = server_ref.config.test_verbose if server_ref else False
         
         # Try to allocate and bind three ports
         if not self._initialize_sockets(port_manager):
@@ -455,15 +333,6 @@ class ServerClientComms:
         if not data:
             return False
         
-        # Store the source address for replies on each port type
-        if src_addr:
-            if port_type == PortType.CONTROL:
-                self.control_client_addr = src_addr
-            elif port_type == PortType.UPLOAD:
-                self.upload_client_addr = src_addr
-            elif port_type == PortType.DOWNLOAD:
-                self.download_client_addr = src_addr
-        
         # Mark that this port has received data
         if port_type == PortType.CONTROL:
             self.control_received = True
@@ -545,130 +414,7 @@ class ServerClientComms:
                     sys.stderr.flush()
                     self.record_latency(port_label, latency)
 
-        # Handle CONTROL messages
-        if mt == MessageType.CONTROL and port_type == PortType.CONTROL:
-            if isinstance(json_obj, dict):
-                cmd = json_obj.get('cmd')
-                if cmd == 'BWUP':
-                    # Create UploadControlMessage with ack=0 and the channel from the request
-                    channel_from_client = json_obj.get('channel', data_channel)
-                    ucm = UploadControlMessage({'cmd': 'BWUP', 'ack': 0, 'channel': channel_from_client})
-                    uid = ucm.get_uid()
-                    self.upload_control_messages[uid] = ucm
-                    if self.test_verbose:
-                        print(f"Server received BWUP from {self.client_addr[0]}:{self.client_addr[1]} on channel {channel_from_client}, created UCM {uid}", file=sys.stderr)
-                        sys.stderr.flush()
-
         return True
-    
-    def send_upload_control_messages(self):
-        """Send/resend upload control messages and delete those with ack=0"""
-        current_time = time.time()
-        to_delete = []
-        
-        # Need to know where to send - use stored control client address
-        if not self.control_client_addr:
-            return  # Don't send if we don't know where to send to
-        
-        for uid, ucm in list(self.upload_control_messages.items()):
-            # Send the message on control port
-            try:
-                params = ucm.get_params()
-                # Use a channel number from the params or generate one
-                channel = params.get('channel', 1)
-                seq = self.get_and_increment_sequence(self.control_port, channel)
-                message = MessagePacket.format_packet(MessageType.CONTROL, channel, seq, 0, params)
-                self.control_socket.sendto(message, self.control_client_addr)
-                ucm.last_sent = current_time
-                if self.test_verbose:
-                    print(f"Server sent UCM {uid} to {self.control_client_addr[0]}:{self.control_client_addr[1]}: {params}", file=sys.stderr)
-                    sys.stderr.flush()
-                
-                # Check if this is the first BWUP ack being sent
-                cmd = params.get('cmd')
-                if cmd == 'BWUP' and params.get('ack') == 0 and self.upload_bandwidth_started is None:
-                    # Start upload bandwidth test mode
-                    self.upload_bandwidth_started = current_time
-                    # Create UploadDataSink with BANDWIDTH type and the channel
-                    uds = UploadDataSink(UDS_Type.BANDWIDTH, channel)
-                    self.upload_data_sinks[channel] = uds
-                    if self.test_verbose:
-                        print(f"Server started upload bandwidth test on channel {channel}", file=sys.stderr)
-                        sys.stderr.flush()
-                
-                # Check if should be deleted (ack=0)
-                if ucm.should_delete():
-                    to_delete.append(uid)
-            except Exception as e:
-                if self.test_verbose:
-                    print(f"Error sending UCM {uid}: {e}", file=sys.stderr)
-                    sys.stderr.flush()
-        
-        # Delete messages that were sent with ack=0
-        for uid in to_delete:
-            del self.upload_control_messages[uid]
-            if self.test_verbose:
-                print(f"Server deleted UCM {uid} (ack=0)", file=sys.stderr)
-                sys.stderr.flush()
-    
-    def check_upload_bandwidth_timeout(self):
-        """Check if upload bandwidth test has timed out (30 seconds) and clean up if needed"""
-        if self.upload_bandwidth_started is not None:
-            current_time = time.time()
-            elapsed = current_time - self.upload_bandwidth_started
-            
-            if elapsed >= 30.0:  # 30 seconds
-                # Exit upload bandwidth test mode
-                self.upload_bandwidth_started = None
-                
-                # Remove all UploadDataSink instances
-                channels_to_remove = list(self.upload_data_sinks.keys())
-                for channel in channels_to_remove:
-                    del self.upload_data_sinks[channel]
-                    if self.test_verbose:
-                        print(f"Server stopped upload bandwidth test on channel {channel} (30 second timeout)", file=sys.stderr)
-                        sys.stderr.flush()
-    
-    def send_flow_control_messages(self):
-        """Send FLOW_CONTROL messages for all active upload data sinks"""
-        if not self.upload_client_addr:
-            return  # Don't send if we don't know where to send to
-        
-        current_time = time.time()
-        
-        for channel, sink in self.upload_data_sinks.items():
-            # Calculate time since last send in milliseconds
-            time_since_last = (current_time - sink.last_flow_control_sent) * 1000
-            
-            # Calculate resend interval from config: adjustment_delay / flow_control_rate
-            # adjustment_delay is in milliseconds in config
-            if self.server and self.server.config:
-                resend_interval_ms = self.server.config.adjustment_delay / self.server.config.flow_control_rate
-            else:
-                resend_interval_ms = 1000.0  # Default to 1 second
-            
-            # Send if enough time has passed
-            if time_since_last >= resend_interval_ms:
-                try:
-                    # Get binary representation of sequence spans
-                    if sink.sequence_span:
-                        binary_data = sink.sequence_span.to_binary()
-                    else:
-                        binary_data = b''
-                    
-                    # Create FLOW_CONTROL message with binary data
-                    seq = self.get_and_increment_sequence(self.upload_port, channel)
-                    message = MessagePacket.format_binary_packet(MessageType.FLOW_CONTROL, channel, seq, 0, binary_data)
-                    self.upload_socket.sendto(message, self.upload_client_addr)
-                    sink.last_flow_control_sent = current_time
-                    
-                    if self.test_verbose:
-                        print(f"Server sent FLOW_CONTROL on channel {channel} to {self.upload_client_addr[0]}:{self.upload_client_addr[1]}", file=sys.stderr)
-                        sys.stderr.flush()
-                except Exception as e:
-                    if self.test_verbose:
-                        print(f"Error sending FLOW_CONTROL on channel {channel}: {e}", file=sys.stderr)
-                        sys.stderr.flush()
     
     def close(self):
         """Close all sockets"""
@@ -780,16 +526,14 @@ incoming_sleep=0
 max_send_time=0
 send_sleep=0
 
-# Heartbeat ms
+# Heartbeat and flow control (milliseconds for heartbeat_rate)
 heartbeat_rate=5000
-
-# Flow control ms
-adjustment_delay=3000  # three seconds
-flow_control_rate=3
+adjustment_delay=1000000
+flow_control_rate=10
 
 # Socket blocking times (milliseconds)
-server_block_time=10
-client_block_time=10
+server_block_time=100
+client_block_time=100
 """
         
         try:
@@ -823,7 +567,7 @@ client_block_time=10
                 'max_send_time': '0',
                 'send_sleep': '0',
                 'heartbeat_rate': '5000',
-                'adjustment_delay': '1000',
+                'adjustment_delay': '1000000',
                 'flow_control_rate': '10',
                 'server_block_time': '100',
                 'client_block_time': '100'
@@ -898,7 +642,7 @@ client_block_time=10
                 
                 f.write("# Heartbeat and flow control (milliseconds for heartbeat_rate)\n")
                 f.write(f"heartbeat_rate={config_dict.get('heartbeat_rate', '5000')}\n")
-                f.write(f"adjustment_delay={config_dict.get('adjustment_delay', '1000')}\n")
+                f.write(f"adjustment_delay={config_dict.get('adjustment_delay', '1000000')}\n")
                 f.write(f"flow_control_rate={config_dict.get('flow_control_rate', '10')}\n\n")
                 
                 f.write("# Socket blocking times (milliseconds)\n")
@@ -975,16 +719,16 @@ client_block_time=10
                         heartbeat_key = client_comms.get_heartbeat_key()
                         response = f"{ports[0]},{ports[1]},{ports[2]},{heartbeat_key}".encode()
                         self.main_socket.sendto(response, client_addr)
-                #else:
-                #    # Try parsing as our binary MessagePacket (heartbeat, etc.)
-                #    try:
-                #        mt, data_channel, channel_seq, seq_offset, json_obj = MessagePacket.parse_packet(data)
-                #        # Only handle heartbeat types here
-                #        if isinstance(mt, MessageType) and mt in (MessageType.HEARTBEAT_0, MessageType.HEARTBEAT_1, MessageType.HEARTBEAT_2):
-                #            self.handle_heartbeat_message(client_addr, data)
-                #    except Exception:
-                #        # Not a MessagePacket - ignore or handled elsewhere
-                #        pass
+                else:
+                    # Try parsing as our binary MessagePacket (heartbeat, etc.)
+                    try:
+                        mt, data_channel, channel_seq, seq_offset, json_obj = MessagePacket.parse_packet(data)
+                        # Only handle heartbeat types here
+                        if isinstance(mt, MessageType) and mt in (MessageType.HEARTBEAT_0, MessageType.HEARTBEAT_1, MessageType.HEARTBEAT_2):
+                            self.handle_heartbeat_message(client_addr, data)
+                    except Exception:
+                        # Not a MessagePacket - ignore or handled elsewhere
+                        pass
                         
             except socket.timeout:
                 pass
@@ -1024,17 +768,6 @@ client_block_time=10
                     pass
                 except Exception as e:
                     pass
-                
-                # Send/resend upload control messages if any exist
-                if client_comms.upload_control_messages:
-                    client_comms.send_upload_control_messages()
-                
-                # Send FLOW_CONTROL messages for active upload data sinks
-                if client_comms.upload_data_sinks:
-                    client_comms.send_flow_control_messages()
-                
-                # Check if upload bandwidth test has timed out
-                client_comms.check_upload_bandwidth_timeout()
             
             # Sleep if configured
             if self.config.incoming_sleep > 0:
@@ -1103,7 +836,7 @@ client_block_time=10
 class WyndClient:
     """UDP Client for wyndrvr"""
     
-    def __init__(self, server_addr: str, server_port: int, block_time: int = 100, bwup: bool = False, test_verbose: bool = False):
+    def __init__(self, server_addr: str, server_port: int, block_time: int = 100):
         self.server_addr = server_addr
         self.server_port = server_port
         self.main_socket = None
@@ -1115,12 +848,6 @@ class WyndClient:
         self.last_heartbeat = 0
         self.block_time = block_time  # milliseconds
         self.heartbeat_key = None  # Will be set after connecting
-        self.bwup = bwup  # Upload bandwidth test flag
-        self.bwup_channel = None  # Channel number for BWUP test
-        self.bwup_last_sent = 0.0  # Timestamp of last BWUP send
-        self.bwup_acked = False  # Whether BWUP has been acknowledged
-        self.ucm_delay = 100  # milliseconds (will be loaded from config if available)
-        self.test_verbose = test_verbose  # Print test/debug messages
         # Sequence tracking: key is (port, data_channel), value is sequence number
         self._sequences = {}
         # client-side latency stats
@@ -1218,10 +945,6 @@ class WyndClient:
             # Initialize heartbeat timing
             self.last_heartbeat = time.time()
             
-            # If --bwup flag is set, send bandwidth upload test command
-            if self.bwup:
-                self.send_bwup_test()
-            
             # Run main client communication loop
             self.client_comm_loop()
             
@@ -1251,12 +974,6 @@ class WyndClient:
                 self.send_heartbeat()
                 self.last_heartbeat = current_time
             
-            # Check if BWUP needs resending
-            if self.bwup and not self.bwup_acked and self.bwup_last_sent > 0:
-                time_since_last_send = (current_time - self.bwup_last_sent) * 1000  # Convert to milliseconds
-                if time_since_last_send > self.ucm_delay:
-                    self.send_bwup_test()
-            
             # No HEARTBEAT handling on main socket; heartbeats use per-port sockets only.
 
             # Check per-port sockets for heartbeat responses
@@ -1278,20 +995,6 @@ class WyndClient:
 
                 # Check if this is a heartbeat message (data_channel == heartbeat_key)
                 if data_channel != self.heartbeat_key:
-                    # Not a heartbeat - check for CONTROL and FLOW_CONTROL messages
-                    if mt == MessageType.CONTROL and label == 'CONTROL' and isinstance(json_obj, dict):
-                        cmd = json_obj.get('cmd')
-                        if cmd == 'BWUP' and json_obj.get('ack') == 0:
-                            # Received CONTROL ack for BWUP
-                            self.bwup_acked = True
-                            if self.test_verbose:
-                                print(f"Client received BWUP ack from server", file=sys.stderr)
-                                sys.stderr.flush()
-                    elif mt == MessageType.FLOW_CONTROL and label == 'UPLOAD':
-                        # Received FLOW_CONTROL message
-                        if self.test_verbose:
-                            print(f"Client received FLOW_CONTROL on channel {data_channel}", file=sys.stderr)
-                            sys.stderr.flush()
                     continue
 
                 if mt == MessageType.HEARTBEAT_1:
@@ -1343,40 +1046,6 @@ class WyndClient:
                 self.download_socket.sendto(message_down, (self.server_addr, self.download_port))
         except Exception:
             pass
-    
-    def send_bwup_test(self):
-        """Send BWUP control message to initiate 30-second upload bandwidth test"""
-        # Generate random channel number (1 to max 3-byte positive int, but not heartbeat_key)
-        max_3byte = (2 ** 24) - 1  # 16777215
-        
-        # Only generate new channel if we don't have one yet
-        if self.bwup_channel is None:
-            while True:
-                channel = random.randint(1, max_3byte)
-                if channel != self.heartbeat_key:
-                    break
-            self.bwup_channel = channel
-        else:
-            channel = self.bwup_channel
-        
-        # Create CONTROL message with BWUP command
-        json_payload = {
-            'cmd': 'BWUP',
-            'channel': channel
-        }
-        
-        # Send CONTROL message on control port
-        try:
-            seq = self.get_and_increment_sequence(self.control_port, channel)
-            message = MessagePacket.format_packet(MessageType.CONTROL, channel, seq, 0, json_payload)
-            self.control_socket.sendto(message, (self.server_addr, self.control_port))
-            self.bwup_last_sent = time.time()
-            if self.test_verbose:
-                print(f"Client sent BWUP on channel {channel}", file=sys.stderr)
-                sys.stderr.flush()
-        except Exception as e:
-            print(f"Error sending BWUP test command: {e}", file=sys.stderr)
-            sys.stderr.flush()
     
     def stop(self):
         """Stop the client"""
@@ -1522,16 +1191,6 @@ def main():
         help='Client socket block time in milliseconds (default: 100)'
     )
     parser.add_argument(
-        '--bwup',
-        action='store_true',
-        help='Start a 30-second upload bandwidth test when connecting in client mode'
-    )
-    parser.add_argument(
-        '--test-verbose',
-        action='store_true',
-        help='Print verbose test/debug messages for control packets (default: False)'
-    )
-    parser.add_argument(
         'client_target',
         nargs='?',
         metavar='[addr]:[port]',
@@ -1591,10 +1250,6 @@ def main():
             config.bind_addr = addr
             config.bind_port = port
         
-        # Set test_verbose flag
-        if args.test_verbose:
-            config.test_verbose = True
-        
         server.config = config
         
         try:
@@ -1613,18 +1268,15 @@ def main():
         
         # Load config to get client_block_time if available
         block_time = 100  # default
-        config = None
         if config_path.exists():
             server = WyndServer(ServerConfig())
             config = server.load_config(config_path)
             block_time = config.client_block_time
         
-        client = WyndClient(addr, port, block_time, bwup=args.bwup, test_verbose=args.test_verbose)
+        client = WyndClient(addr, port, block_time)
         # Set heartbeat interval from config if present (milliseconds -> seconds)
         try:
-            if config:
-                client.heartbeat_interval = config.heartbeat_rate / 1000.0
-                client.ucm_delay = config.ucm_delay
+            client.heartbeat_interval = config.heartbeat_rate / 1000.0
         except Exception:
             pass
         
