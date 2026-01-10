@@ -113,7 +113,6 @@ def test_server_client_connection():
     print("\n" + "=" * 60)
     print("✓ Integration test passed - server and client communicated successfully")
     print("=" * 60)
-    return 0
 
 
 if __name__ == "__main__":

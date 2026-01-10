@@ -54,7 +54,6 @@ def test_sequence_span_get_lowest():
     assert span2.get_lowest() == 100
     
     print("SequenceSpan.get_lowest() tests passed!")
-    return 0
 
 
 def test_bandwidth_packet_format():
@@ -103,7 +102,6 @@ def test_bandwidth_packet_format():
     assert len(json_obj['dummy_data']) == bw_packet_length
     
     print("BANDWIDTH_TEST packet format tests passed!")
-    return 0
 
 
 if __name__ == '__main__':

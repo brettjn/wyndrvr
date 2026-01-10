@@ -144,7 +144,6 @@ def test_flow_control_packets():
     print("\n" + "=" * 60)
     print("✓ FLOW_CONTROL integration test passed")
     print("=" * 60)
-    return 0
 
 
 if __name__ == "__main__":

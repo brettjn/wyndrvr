@@ -5,8 +5,19 @@ A UDP-based network testing tool for measuring latency and bandwidth.
 """
 
 
-__version__ = "0.8"
+__version__ = "0.9"
 __version_notes__ = """
+Version 0.9:
+- Added --test-drop-rate option to simulate packet loss (default: 0)
+- test_drop_rate value is probability (0.0-1.0) that a packet will be dropped
+- When test_drop_rate > 0, random number generated before each sendto call
+- If random() < test_drop_rate, packet is not sent (simulating network loss)
+- Applies to all packet types: heartbeats, control, bandwidth test, flow control
+- Useful for testing protocol reliability and retransmission logic
+- Added --test-delay option with configurable delay in communication loops (default: 100ms if flag used, 0 if not)
+- Added --version argument to print version number
+- Added verbose logging for BANDWIDTH_TEST packet sends/receives when using --test-verbose
+
 Version 0.8:
 - Implemented BANDWIDTH_TEST packet generation and sending
 - Added SequenceSpan.get_lowest() method to retrieve and remove lowest sequence number
@@ -336,6 +347,8 @@ class ServerConfig:
     ucm_delay: int = 100  # milliseconds (upload control message delay)
     test_verbose: bool = False  # Print test/debug messages
     bw_packet_length: int = 900  # bytes (bandwidth test packet payload length)
+    test_delay: int = 0  # milliseconds (delay in communication loops for testing)
+    test_drop_rate: float = 0.0  # probability (0.0-1.0) of dropping packets for testing
     
     def __post_init__(self):
         if self.port_ranges is None:
@@ -486,6 +499,12 @@ class ServerClientComms:
         # Increment and handle rollover at max 64-bit unsigned int
         self._sequences[key] = (seq + 1) % (2**64)
         return seq
+    
+    def should_drop_packet(self) -> bool:
+        """Check if packet should be dropped based on test_drop_rate"""
+        if self.server and self.server.config.test_drop_rate > 0:
+            return random.random() < self.server.config.test_drop_rate
+        return False
 
     def record_latency(self, port_label: str, latency_ms: float):
         """Record latency measurement for this client"""
@@ -576,17 +595,20 @@ class ServerClientComms:
                 if src_addr:
                     if port_type == PortType.CONTROL and self.control_socket:
                         try:
-                            self.control_socket.sendto(resp, src_addr)
+                            if not self.should_drop_packet():
+                                self.control_socket.sendto(resp, src_addr)
                         except Exception:
                             pass
                     elif port_type == PortType.UPLOAD and self.upload_socket:
                         try:
-                            self.upload_socket.sendto(resp, src_addr)
+                            if not self.should_drop_packet():
+                                self.upload_socket.sendto(resp, src_addr)
                         except Exception:
                             pass
                     elif port_type == PortType.DOWNLOAD and self.download_socket:
                         try:
-                            self.download_socket.sendto(resp, src_addr)
+                            if not self.should_drop_packet():
+                                self.download_socket.sendto(resp, src_addr)
                         except Exception:
                             pass
 
@@ -619,8 +641,16 @@ class ServerClientComms:
                     uid = ucm.get_uid()
                     self.upload_control_messages[uid] = ucm
                     if self.test_verbose:
-                        print(f"Server received BWUP from {self.client_addr[0]}:{self.client_addr[1]} on channel {channel_from_client}, created UCM {uid}", file=sys.stderr)
+                        print(f"Server received BWUP packet from {self.client_addr[0]}:{self.client_addr[1]} on channel {channel_from_client}, created UCM {uid}", file=sys.stderr)
                         sys.stderr.flush()
+        
+        # Handle BANDWIDTH_TEST messages (upload bandwidth test data)
+        if mt == MessageType.BANDWIDTH_TEST and port_type == PortType.UPLOAD:
+            # Check if we have an active upload data sink for this channel
+            if data_channel in self.upload_data_sinks:
+                if self.test_verbose:
+                    print(f"Server received BANDWIDTH_TEST packet seq={channel_sequence_number} from {self.client_addr[0]}:{self.client_addr[1]} on channel {data_channel}", file=sys.stderr)
+                    sys.stderr.flush()
 
         return True
     
@@ -641,7 +671,8 @@ class ServerClientComms:
                 channel = params.get('channel', 1)
                 seq = self.get_and_increment_sequence(self.control_port, channel)
                 message = MessagePacket.format_packet(MessageType.CONTROL, channel, seq, 0, params)
-                self.control_socket.sendto(message, self.control_client_addr)
+                if not self.should_drop_packet():
+                    self.control_socket.sendto(message, self.control_client_addr)
                 ucm.last_sent = current_time
                 if self.test_verbose:
                     print(f"Server sent UCM {uid} to {self.control_client_addr[0]}:{self.control_client_addr[1]}: {params}", file=sys.stderr)
@@ -722,7 +753,8 @@ class ServerClientComms:
                     # Create FLOW_CONTROL message with binary data
                     seq = self.get_and_increment_sequence(self.upload_port, channel)
                     message = MessagePacket.format_binary_packet(MessageType.FLOW_CONTROL, channel, seq, 0, binary_data)
-                    self.upload_socket.sendto(message, self.upload_client_addr)
+                    if not self.should_drop_packet():
+                        self.upload_socket.sendto(message, self.upload_client_addr)
                     sink.last_flow_control_sent = current_time
                     
                     if self.test_verbose:
@@ -1049,7 +1081,8 @@ bw_packet_length=900
                         ports = client_comms.get_ports()
                         heartbeat_key = client_comms.get_heartbeat_key()
                         response = f"{ports[0]},{ports[1]},{ports[2]},{heartbeat_key}".encode()
-                        self.main_socket.sendto(response, client_addr)
+                        if self.config.test_drop_rate == 0 or random.random() >= self.config.test_drop_rate:
+                            self.main_socket.sendto(response, client_addr)
                 #else:
                 #    # Try parsing as our binary MessagePacket (heartbeat, etc.)
                 #    try:
@@ -1111,6 +1144,10 @@ bw_packet_length=900
                 # Check if upload bandwidth test has timed out
                 client_comms.check_upload_bandwidth_timeout()
             
+            # Test delay if configured
+            if self.config.test_delay > 0:
+                time.sleep(self.config.test_delay / 1000.0)
+            
             # Sleep if configured
             if self.config.incoming_sleep > 0:
                 time.sleep(self.config.incoming_sleep / 1_000_000)
@@ -1146,7 +1183,8 @@ bw_packet_length=900
                 pass
 
             try:
-                out_sock.sendto(resp, client_addr)
+                if self.config.test_drop_rate == 0 or random.random() >= self.config.test_drop_rate:
+                    out_sock.sendto(resp, client_addr)
             except Exception:
                 pass
             return
@@ -1178,7 +1216,7 @@ bw_packet_length=900
 class WyndClient:
     """UDP Client for wyndrvr"""
     
-    def __init__(self, server_addr: str, server_port: int, block_time: int = 100, bwup: bool = False, test_verbose: bool = False):
+    def __init__(self, server_addr: str, server_port: int, block_time: int = 100, bwup: bool = False, test_verbose: bool = False, test_delay: int = 0, test_drop_rate: float = 0.0):
         self.server_addr = server_addr
         self.server_port = server_port
         self.main_socket = None
@@ -1196,6 +1234,8 @@ class WyndClient:
         self.bwup_acked = False  # Whether BWUP has been acknowledged
         self.ucm_delay = 100  # milliseconds (will be loaded from config if available)
         self.test_verbose = test_verbose  # Print test/debug messages
+        self.test_delay = test_delay  # milliseconds (delay in communication loop)
+        self.test_drop_rate = test_drop_rate  # probability (0.0-1.0) of dropping packets
         self.flow_control_rate = 3  # Will be loaded from config if available
         self.bw_packet_length = 900  # bytes (will be loaded from config if available)
         self.bw_test_start_time = None  # Timestamp when bandwidth test started
@@ -1241,6 +1281,12 @@ class WyndClient:
         self._sequences[key] = (seq + 1) % (2**64)
         return seq
     
+    def should_drop_packet(self) -> bool:
+        """Check if packet should be dropped based on test_drop_rate"""
+        if self.test_drop_rate > 0:
+            return random.random() < self.test_drop_rate
+        return False
+    
     def start(self):
         """Start the client and connect to server"""
         self.running = True
@@ -1252,7 +1298,8 @@ class WyndClient:
         sys.stdout.flush()
         
         # Send initial connection request
-        self.main_socket.sendto(b"CONNECT", (self.server_addr, self.server_port))
+        if not self.should_drop_packet():
+            self.main_socket.sendto(b"CONNECT", (self.server_addr, self.server_port))
         
         # Wait for port assignment
         self.main_socket.settimeout(5.0)
@@ -1294,9 +1341,12 @@ class WyndClient:
             msg_up = MessagePacket.format_packet(MessageType.HEARTBEAT_0, self.heartbeat_key, seq_up, 0, {'timestamp': ts})
             msg_down = MessagePacket.format_packet(MessageType.HEARTBEAT_0, self.heartbeat_key, seq_down, 0, {'timestamp': ts})
 
-            self.control_socket.sendto(msg_ctrl, (self.server_addr, self.control_port))
-            self.upload_socket.sendto(msg_up, (self.server_addr, self.upload_port))
-            self.download_socket.sendto(msg_down, (self.server_addr, self.download_port))
+            if not self.should_drop_packet():
+                self.control_socket.sendto(msg_ctrl, (self.server_addr, self.control_port))
+            if not self.should_drop_packet():
+                self.upload_socket.sendto(msg_up, (self.server_addr, self.upload_port))
+            if not self.should_drop_packet():
+                self.download_socket.sendto(msg_down, (self.server_addr, self.download_port))
             
             print("Client connected successfully")
             sys.stdout.flush()
@@ -1424,10 +1474,15 @@ class WyndClient:
                     resp_json = {'client_timestamp': client_timestamp, 'server_timestamp': server_timestamp}
                     resp_seq = self.get_and_increment_sequence(port, data_channel)
                     resp = MessagePacket.format_packet(MessageType.HEARTBEAT_2, data_channel, resp_seq, seq_offset, resp_json)
-                    sock.sendto(resp, (self.server_addr, port))
+                    if not self.should_drop_packet():
+                        sock.sendto(resp, (self.server_addr, port))
             
             # Send bandwidth test packets if in test mode
             self.send_bandwidth_test_packets()
+            
+            # Test delay if configured
+            if self.test_delay > 0:
+                time.sleep(self.test_delay / 1000.0)
     
     def send_bandwidth_test_packets(self):
         """Send bandwidth test packets if in test mode and have working_sequence_span"""
@@ -1451,8 +1506,15 @@ class WyndClient:
         
         # Send packets without blocking - send as many as we can in this iteration
         # Typically send a few packets per iteration to maintain throughput
-        packets_per_iteration = 10
+        packets_per_iteration = 1
+
+        # Generate dummy data to target length
+        repeats_needed = (self.bw_packet_length + len(self.dummy_data_base) - 1) // len(self.dummy_data_base)
+        dummy_data = (self.dummy_data_base * repeats_needed)[:self.bw_packet_length]
         
+        # Create JSON payload
+        json_payload = {'dummy_data': dummy_data}
+
         for _ in range(packets_per_iteration):
             # Get next sequence number
             seq_num = self.working_sequence_span.get_lowest()
@@ -1461,12 +1523,6 @@ class WyndClient:
                 break
             
             try:
-                # Generate dummy data to target length
-                repeats_needed = (self.bw_packet_length + len(self.dummy_data_base) - 1) // len(self.dummy_data_base)
-                dummy_data = (self.dummy_data_base * repeats_needed)[:self.bw_packet_length]
-                
-                # Create JSON payload
-                json_payload = {'dummy_data': dummy_data}
                 
                 # Create BANDWIDTH_TEST packet
                 message = MessagePacket.format_packet(
@@ -1478,7 +1534,13 @@ class WyndClient:
                 )
                 
                 # Send on upload port
-                self.upload_socket.sendto(message, (self.server_addr, self.upload_port))
+                if not self.should_drop_packet():
+                    self.upload_socket.sendto(message, (self.server_addr, self.upload_port))
+                
+                # Verbose logging
+                if self.test_verbose:
+                    print(f"Client sent BANDWIDTH_TEST packet seq={seq_num} on channel {self.bwup_channel}", file=sys.stderr)
+                    sys.stderr.flush()
                 
             except Exception as e:
                 if self.test_verbose:
@@ -1495,21 +1557,24 @@ class WyndClient:
             if self.control_socket and self.control_port:
                 seq_ctrl = self.get_and_increment_sequence(self.control_port, self.heartbeat_key)
                 message_ctrl = MessagePacket.format_packet(MessageType.HEARTBEAT_0, self.heartbeat_key, seq_ctrl, 0, json_obj)
-                self.control_socket.sendto(message_ctrl, (self.server_addr, self.control_port))
+                if not self.should_drop_packet():
+                    self.control_socket.sendto(message_ctrl, (self.server_addr, self.control_port))
         except Exception:
             pass
         try:
             if self.upload_socket and self.upload_port:
                 seq_up = self.get_and_increment_sequence(self.upload_port, self.heartbeat_key)
                 message_up = MessagePacket.format_packet(MessageType.HEARTBEAT_0, self.heartbeat_key, seq_up, 0, json_obj)
-                self.upload_socket.sendto(message_up, (self.server_addr, self.upload_port))
+                if not self.should_drop_packet():
+                    self.upload_socket.sendto(message_up, (self.server_addr, self.upload_port))
         except Exception:
             pass
         try:
             if self.download_socket and self.download_port:
                 seq_down = self.get_and_increment_sequence(self.download_port, self.heartbeat_key)
                 message_down = MessagePacket.format_packet(MessageType.HEARTBEAT_0, self.heartbeat_key, seq_down, 0, json_obj)
-                self.download_socket.sendto(message_down, (self.server_addr, self.download_port))
+                if not self.should_drop_packet():
+                    self.download_socket.sendto(message_down, (self.server_addr, self.download_port))
         except Exception:
             pass
     
@@ -1538,10 +1603,11 @@ class WyndClient:
         try:
             seq = self.get_and_increment_sequence(self.control_port, channel)
             message = MessagePacket.format_packet(MessageType.CONTROL, channel, seq, 0, json_payload)
-            self.control_socket.sendto(message, (self.server_addr, self.control_port))
+            if not self.should_drop_packet():
+                self.control_socket.sendto(message, (self.server_addr, self.control_port))
             self.bwup_last_sent = time.time()
             if self.test_verbose:
-                print(f"Client sent BWUP on channel {channel}", file=sys.stderr)
+                print(f"Client sent BWUP packet on channel {channel}", file=sys.stderr)
                 sys.stderr.flush()
         except Exception as e:
             print(f"Error sending BWUP test command: {e}", file=sys.stderr)
@@ -1701,6 +1767,25 @@ def main():
         help='Print verbose test/debug messages for control packets (default: False)'
     )
     parser.add_argument(
+        '--test-delay',
+        type=int,
+        nargs='?',
+        const=100,
+        metavar='milliseconds',
+        help='Add delay in communication loops for testing (default: 100ms if flag used, 0 if not)'
+    )
+    parser.add_argument(
+        '--test-drop-rate',
+        type=float,
+        metavar='probability',
+        help='Probability (0.0-1.0) of dropping packets for testing (default: 0.0)'
+    )
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'wyndrvr {__version__}'
+    )
+    parser.add_argument(
         'client_target',
         nargs='?',
         metavar='[addr]:[port]',
@@ -1764,6 +1849,14 @@ def main():
         if args.test_verbose:
             config.test_verbose = True
         
+        # Set test_delay if provided
+        if args.test_delay is not None:
+            config.test_delay = args.test_delay
+        
+        # Set test_drop_rate if provided
+        if args.test_drop_rate is not None:
+            config.test_drop_rate = args.test_drop_rate
+        
         server.config = config
         
         try:
@@ -1780,15 +1873,23 @@ def main():
         # Client mode
         addr, port = parse_addr_port(args.client_target, default_port=6711)
         
-        # Load config to get client_block_time if available
+        # Load config to get client_block_time and test_delay if available
         block_time = 100  # default
+        test_delay = 0 if args.test_delay is None else args.test_delay  # default 0, or value from args
+        test_drop_rate = 0.0 if args.test_drop_rate is None else args.test_drop_rate  # default 0.0, or value from args
         config = None
         if config_path.exists():
             server = WyndServer(ServerConfig())
             config = server.load_config(config_path)
             block_time = config.client_block_time
+            # Only override test_delay from config if not specified on command line
+            if args.test_delay is None:
+                test_delay = config.test_delay
+            # Only override test_drop_rate from config if not specified on command line
+            if args.test_drop_rate is None:
+                test_drop_rate = config.test_drop_rate
         
-        client = WyndClient(addr, port, block_time, bwup=args.bwup, test_verbose=args.test_verbose)
+        client = WyndClient(addr, port, block_time, bwup=args.bwup, test_verbose=args.test_verbose, test_delay=test_delay, test_drop_rate=test_drop_rate)
         # Set heartbeat interval from config if present (milliseconds -> seconds)
         try:
             if config:

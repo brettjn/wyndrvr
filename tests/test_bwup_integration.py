@@ -131,7 +131,6 @@ def test_bwup_mode():
     print("\n" + "=" * 60)
     print("✓ BWUP integration test passed")
     print("=" * 60)
-    return 0
 
 
 if __name__ == "__main__":
