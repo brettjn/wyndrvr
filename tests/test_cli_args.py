@@ -47,16 +47,30 @@ def test_help():
 
 
 def test_no_args():
-    """Test running with no arguments"""
+    """Test running with no arguments - should default to client mode connecting to 127.0.0.1:6711"""
     print("\nTesting no arguments...")
-    result = subprocess.run(
-        [sys.executable, str(WYNDRVR_PATH)],
-        capture_output=True,
-        text=True
-    )
-    assert result.returncode == 1, "No args should return 1"
-    assert "usage:" in result.stdout.lower() or "usage:" in result.stderr.lower(), "Should show usage"
-    print("✓ No arguments shows usage and exits with code 1")
+    # Run with short timeout since client will keep running
+    try:
+        result = subprocess.run(
+            [sys.executable, str(WYNDRVR_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=2  # Short timeout - client runs indefinitely
+        )
+        # If it returns quickly, check for timeout error (no server case)
+        assert result.returncode == 0, "No args should run as client and return 0"
+        assert "Connecting to server 127.0.0.1:6711" in result.stdout, "Should attempt to connect to 127.0.0.1:6711"
+    except subprocess.TimeoutExpired as e:
+        # This is expected - client connects and runs indefinitely
+        # Check that it attempted connection
+        stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+        assert "Connecting to server 127.0.0.1:6711" in stdout, "Should attempt to connect to 127.0.0.1:6711"
+        # Either successfully connected (and running) or timed out waiting for server
+        # Both are valid behaviors for client mode
+        print("✓ No arguments defaults to client mode connecting to 127.0.0.1:6711")
+    else:
+        print("✓ No arguments defaults to client mode connecting to 127.0.0.1:6711")
 
 
 def test_create_config():

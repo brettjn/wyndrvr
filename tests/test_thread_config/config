@@ -1,0 +1,16 @@
+# wyndrvr configuration file
+bind_addr=0.0.0.0
+bind_port=6720
+port_ranges=7100-8000
+connection_parallelibility=SINGLE
+port_parallelability=THREAD
+incoming_blocking_level=0
+incoming_sleep=0
+max_send_time=0
+send_sleep=0
+heartbeat_rate=5000
+adjustment_delay=1000
+flow_control_rate=10
+server_block_time=100
+client_block_time=100
+test_verbose=true
