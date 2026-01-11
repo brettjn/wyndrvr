@@ -120,9 +120,10 @@ import random
 import uuid
 from pathlib import Path
 from enum import Enum
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Union
 from dataclasses import dataclass
 import signal
+import traceback
 
 
 class ParallelMode(Enum):
@@ -599,19 +600,29 @@ class ServerClientComms:
             else:
                 print(f"    {label:9}: no samples")
     
-    def handle_client_connection(self, data: bytes, port_type: PortType, src_addr: Optional[Tuple[str,int]] = None) -> bool:
-        """Handle data received on one of the client's ports
-        
-        Args:
-            data: The received data
-            port_type: PortType enum value (CONTROL, UPLOAD, or DOWNLOAD)
-            
-        Returns:
-            True if data was received and processed, False otherwise
+    def handle_client_connection(self, data: Union[bytes, List[Tuple[bytes, Optional[Tuple[str,int]]]]], port_type: PortType, src_addr: Optional[Tuple[str,int]] = None) -> bool:
+        """Handle data received on one of the client's ports.
+
+        Accepts either a single data packet (bytes) with optional src_addr,
+        or a list of `(data_bytes, src_addr)` tuples. Returns True if any
+        data was received and processed, False otherwise.
         """
+        # If passed a list of packets, iterate and process each
+        if isinstance(data, list):
+            any_processed = False
+            for item in data:
+                if isinstance(item, tuple):
+                    d, s = item
+                else:
+                    d, s = item, src_addr
+                processed = self.handle_client_connection(d, port_type, s)
+                any_processed = any_processed or bool(processed)
+            return any_processed
+
+        # Single-packet path (original behavior)
         if not data:
             return False
-        
+
         # Store the source address for replies on each port type
         if src_addr:
             if port_type == PortType.CONTROL:
@@ -620,7 +631,7 @@ class ServerClientComms:
                 self.upload_client_addr = src_addr
             elif port_type == PortType.DOWNLOAD:
                 self.download_client_addr = src_addr
-        
+
         # Mark that this port has received data
         if port_type == PortType.CONTROL:
             self.control_received = True
@@ -628,14 +639,14 @@ class ServerClientComms:
             self.upload_received = True
         elif port_type == PortType.DOWNLOAD:
             self.download_received = True
-        
+
         # Check if all three ports have received at least one packet
         if self.control_received and self.upload_received and self.download_received:
             if not self.comms_up:
                 print(f"Client {self.client_addr[0]}:{self.client_addr[1]} - all ports active, comms_up=True")
                 sys.stdout.flush()
             self.comms_up = True
-        
+
         # Try parse as MessagePacket and handle heartbeat latency printing or replies
         try:
             mt, data_channel, channel_sequence_number, sequence_offset, json_obj = MessagePacket.parse_packet(data)
@@ -1270,34 +1281,46 @@ bw_packet_length=900
             
             # Poll all client sockets for data
             for client_addr, client_comms in list(self.client_connections.items()):
-                # Poll control socket
+                # Poll control socket repeatedly until no more data
                 try:
-                    data, src = client_comms.control_socket.recvfrom(4096)
-                    #print(f"received {len(data)} bytes of packet data on control port")
-                    client_comms.handle_client_connection(data, PortType.CONTROL, src)
-                except BlockingIOError:
-                    pass
-                except Exception as e:
+                    adata = []
+                    while True:
+                        try:
+                            data, src = client_comms.control_socket.recvfrom(4096)
+                            adata.append((data, src))
+                        except BlockingIOError:
+                            break
+                    if adata:
+                        client_comms.handle_client_connection(adata, PortType.CONTROL)
+                except Exception:
                     pass
                 
-                # Poll upload socket
+                # Poll upload socket repeatedly until no more data
                 try:
-                    data, src = client_comms.upload_socket.recvfrom(4096)
-                    #print(f"received {len(data)} bytes of packet data on upload port")
-                    client_comms.handle_client_connection(data, PortType.UPLOAD, src)
-                except BlockingIOError:
-                    pass
-                except Exception as e:
+                    adata = []
+                    while True:
+                        try:
+                            data, src = client_comms.upload_socket.recvfrom(4096)
+                            adata.append((data, src))
+                        except BlockingIOError:
+                            break
+                    if adata:
+                        client_comms.handle_client_connection(adata, PortType.UPLOAD)
+                except Exception:
                     pass
                 
-                # Poll download socket
+                # Poll download socket repeatedly until no more data
                 try:
-                    data, src = client_comms.download_socket.recvfrom(4096)
-                    #print(f"received {len(data)} bytes of packet data on download port")
-                    client_comms.handle_client_connection(data, PortType.DOWNLOAD, src)
-                except BlockingIOError:
-                    pass
-                except Exception as e:
+                    adata = []
+                    while True:
+                        try:
+                            data, src = client_comms.download_socket.recvfrom(4096)
+                            adata.append((data, src))
+                        except BlockingIOError:
+                            break
+                    if adata:
+                        client_comms.handle_client_connection(adata, PortType.DOWNLOAD)
+                except Exception:
                     pass
                 
                 # Send/resend upload control messages if any exist
@@ -1555,6 +1578,7 @@ class WyndClient:
             
         except Exception as e:
             print(f"Error connecting to server: {e}", file=sys.stderr)
+            traceback.print_exc()
             self.running = False
     
     def client_comm_loop(self):
@@ -1730,7 +1754,10 @@ class WyndClient:
                     resp_seq = self.get_and_increment_sequence(port, data_channel)
                     resp = MessagePacket.format_packet(MessageType.HEARTBEAT_2, data_channel, resp_seq, seq_offset, resp_json)
                     if not self.should_drop_packet():
-                        sock.sendto(resp, (self.server_addr, port))
+                        try:
+                            sock.sendto(resp, (self.server_addr, port))
+                        except Exception:
+                            pass
             
             # Send bandwidth test packets if in test mode
             self.send_bandwidth_test_packets()

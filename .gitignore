@@ -208,3 +208,6 @@ __marimo__/
 
 # a general pattern for all ODF lock files
 .~lock.*#
+
+#github (for copilot skills)
+.github/
