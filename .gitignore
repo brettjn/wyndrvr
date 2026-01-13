@@ -211,3 +211,6 @@ __marimo__/
 
 #github (for copilot skills)
 .github/
+
+#vscode workdspace
+*.code-workspace

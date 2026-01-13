@@ -7,8 +7,18 @@ A UDP-based network testing tool for measuring latency and bandwidth.
 import threading
 import multiprocessing
 
-__version__ = "0.13"
+__version__ = "0.14"
 __version_notes__ = """
+Version 0.14:
+- Optimized SequenceSpan.get_lowest() from O(n) to O(1) by eliminating search
+- Since spans are always kept in sorted order, lowest sequence is always first span's begin value
+- Added packet count tracking to bandwidth tests (UploadDataSink.packet_count field)
+- Server increments packet_count for each BANDWIDTH_TEST packet received
+- TEST_RESULT message now includes packet_count alongside bytes_received and bandwidth
+- Client displays "Packets Received" in test results output
+- Updated verbose logging to show packet counts in TEST_RESULT statistics
+- Verified all span modification methods maintain numerical order guarantee
+
 Version 0.13:
 - Implemented client-side PROCESS mode for port_parallelability
 - Client now spawns separate processes for control, upload, and download ports when port_parallelability=PROCESS
@@ -286,6 +296,11 @@ class SequenceSpan:
         else:
             # Sort spans by begin value to maintain numerical order
             self.spans = sorted(spans, key=lambda x: x[0])
+        # Track the maximum sequence number returned by get_lowest()
+        # and how many times get_lowest() returned a sequence that did
+        # not increase that maximum.
+        self.max_lowest_returned = None  # type: Optional[int]
+        self.get_lowest_non_increase_count = 0
     
     def get_spans(self) -> List[Tuple[int, int]]:
         """Return the list of spans"""
@@ -324,30 +339,39 @@ class SequenceSpan:
         return cls(spans)
     
     def get_lowest(self) -> Optional[int]:
-        """Get and remove the lowest sequence number from spans"""
+        """Get and remove the lowest sequence number from spans
+        
+        Since spans are always kept in sorted order (by begin value),
+        the lowest sequence number is always the first value of the first span.
+        """
         if not self.spans or len(self.spans) == 0:
             return None
         
-        # Find the span with the lowest begin value
-        min_idx = 0
-        min_begin = self.spans[0][0]
-        for i in range(1, len(self.spans)):
-            if self.spans[i][0] < min_begin:
-                min_begin = self.spans[i][0]
-                min_idx = i
-        
-        # Get the lowest value
-        begin, end = self.spans[min_idx]
+        # Spans are sorted, so first span has lowest begin value
+        begin, end = self.spans[0]
         lowest = begin
         
         # Update the span
         if begin == end:
             # Remove this span entirely
-            self.spans.pop(min_idx)
+            self.spans.pop(0)
         else:
             # Increment the begin value
-            self.spans[min_idx] = (begin + 1, end)
-        
+            self.spans[0] = (begin + 1, end)
+        # Update tracking: maximum returned lowest and non-increase count
+        try:
+            if self.max_lowest_returned is None:
+                self.max_lowest_returned = lowest
+            else:
+                if lowest > self.max_lowest_returned:
+                    self.max_lowest_returned = lowest
+                else:
+                    # did not increase the maximum
+                    self.get_lowest_non_increase_count += 1
+        except Exception:
+            # Be conservative: don't let tracking errors break sequence logic
+            pass
+
         return lowest
     
     def remove_seq(self, seq_num: int) -> bool:
@@ -382,6 +406,7 @@ class SequenceSpan:
                     # Second span: from seq_num+1 to end
                     self.spans[i] = (begin, seq_num - 1)
                     self.spans.insert(i + 1, (seq_num + 1, end))
+                    # Spans remain in order since we're splitting within a span
                 
                 return True
         
@@ -401,6 +426,7 @@ class UploadDataSink:
         self.last_flow_control_sent = 0.0  # Timestamp of last FLOW_CONTROL send
         self.bytes_received = 0  # Total bytes received on this channel
         self.retransmit_count = 0  # Count of retransmitted packets (sequence_offset > 0)
+        self.packet_count = 0  # Total number of packets received on this channel
         
         # For BANDWIDTH type, create a SequenceSpan with default 8-byte span
         if uds_type == UDS_Type.BANDWIDTH:
@@ -805,6 +831,7 @@ class ServerClientComms:
                     uds_data = self.shared_uds_dict[data_channel]
                     uds_data['bytes_received'] = uds_data.get('bytes_received', 0) + len(data)
                     uds_data['retransmit_count'] = sequence_offset
+                    uds_data['packet_count'] = uds_data.get('packet_count', 0) + 1
                     self.shared_uds_dict[data_channel] = uds_data
                 else:
                     # Update local UDS object
@@ -813,6 +840,7 @@ class ServerClientComms:
                         sink.sequence_span.remove_seq(actual_seq_num)
                     sink.bytes_received += len(data)
                     sink.retransmit_count = sequence_offset
+                    sink.packet_count += 1
                 
                 if self.test_verbose:
                     if sequence_offset != 0:
@@ -849,6 +877,7 @@ class ServerClientComms:
             uds = UploadDataSink(UDS_Type.BANDWIDTH, channel)
             uds.bytes_received = uds_data.get('bytes_received', 0)
             uds.retransmit_count = uds_data.get('retransmit_count', 0)
+            uds.packet_count = uds_data.get('packet_count', 0)
             uds.created_at = uds_data.get('created_at', time.time())
             # Note: sequence_span can't be easily shared, will handle differently
             result[channel] = uds
@@ -860,6 +889,7 @@ class ServerClientComms:
             self.shared_uds_dict[channel] = {
                 'bytes_received': uds.bytes_received,
                 'retransmit_count': uds.retransmit_count,
+                'packet_count': uds.packet_count,
                 'created_at': uds.created_at
             }
     
@@ -993,6 +1023,7 @@ class ServerClientComms:
                             'bytes_received': bytes_received,
                             'bandwidth_bps': bandwidth_bps,
                             'retransmit_count': uds_data.get('retransmit_count', 0),
+                            'packet_count': uds_data.get('packet_count', 0),
                             'duration': duration
                         }
                         
@@ -1004,7 +1035,7 @@ class ServerClientComms:
                         }
                         
                         if self.test_verbose:
-                            print(f"Server created TEST_RESULT for channel {channel}: {bandwidth_bps:.2f} bps, {bytes_received} bytes, {uds_data.get('retransmit_count', 0)} retransmits", file=sys.stderr)
+                            print(f"Server created TEST_RESULT for channel {channel}: {bandwidth_bps:.2f} bps, {bytes_received} bytes, {uds_data.get('packet_count', 0)} packets, {uds_data.get('retransmit_count', 0)} retransmits", file=sys.stderr)
                             sys.stderr.flush()
                     
                     # Clear shared UDS dict
@@ -1030,6 +1061,7 @@ class ServerClientComms:
                             'bytes_received': sink.bytes_received,
                             'bandwidth_bps': bandwidth_bps,
                             'retransmit_count': sink.retransmit_count,
+                            'packet_count': sink.packet_count,
                             'duration': duration
                         }
                         
@@ -1038,7 +1070,7 @@ class ServerClientComms:
                         self.upload_control_messages[uid] = ucm
                         
                         if self.test_verbose:
-                            print(f"Server created TEST_RESULT for channel {channel}: {bandwidth_bps:.2f} bps, {sink.bytes_received} bytes, {sink.retransmit_count} retransmits", file=sys.stderr)
+                            print(f"Server created TEST_RESULT for channel {channel}: {bandwidth_bps:.2f} bps, {sink.bytes_received} bytes, {sink.packet_count} packets, {sink.retransmit_count} retransmits", file=sys.stderr)
                             sys.stderr.flush()
                     
                     # Remove all UploadDataSink instances
@@ -2562,11 +2594,24 @@ class WyndClient:
             retransmit_count = self.test_result_data.get('retransmit_count', 0)
             duration = self.test_result_data.get('duration', 0)
             
+            packet_count = self.test_result_data.get('packet_count', 0)
+            
             print(f"\n=== Upload Bandwidth Test Results ===")
             print(f"Duration: {duration:.2f} seconds")
+            print(f"Packets Received: {packet_count}")
             print(f"Bytes Received: {bytes_received}")
             print(f"Bandwidth: {bandwidth_bps:.2f} bps ({bandwidth_mbps:.2f} Mbps)")
             print(f"Retransmitted Packets: {retransmit_count}")
+            # Print working SequenceSpan tracking metrics if available
+            try:
+                working_span = self._get_working_sequence_span()
+                if working_span is not None:
+                    max_ret = getattr(working_span, 'max_lowest_returned', None)
+                    non_inc = getattr(working_span, 'get_lowest_non_increase_count', 0)
+                    print(f"Working span max_lowest_returned: {max_ret}")
+                    print(f"Working span get_lowest_non_increase_count: {non_inc}")
+            except Exception:
+                pass
             sys.stdout.flush()
     
     def send_bandwidth_test_packets(self):
