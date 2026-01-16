@@ -4,6 +4,10 @@ TODO
 
 [x] Default client to 127.0.0.1
 
-[ ] Add --version argument.
+[x] Add --version argument.
+
+[x] IN SINGLE MODE is check_upload_bandwidth_timeout() getting called twice?  Once in WyndServer.server_comm_loop and once in ServerClientComms.port_comm_loop
+
+[ ] In PROCESS mode close UPLOAD and other ports at end of test line 1095
 
 

@@ -3,10 +3,6 @@
 wyndrvr - Latency and Bandwidth Utility
 A UDP-based network testing tool for measuring latency and bandwidth.
 """
-
-import threading
-import multiprocessing
-
 __version__ = "0.14"
 __version_notes__ = """
 Version 0.14:
@@ -128,24 +124,27 @@ Version 0.1:
 - Heartbeat rate changed to milliseconds (default 5000ms)
 """
 
-import argparse
-import socket
-import sys
-import os
-import threading
-import multiprocessing
-import time
-import select
-import struct
-import json
-import random
-import uuid
-from pathlib import Path
-from enum import Enum
-from typing import Optional, Tuple, List, Dict, Union
+import                  argparse
+import                  socket
+import                  sys
+#import os
+import                  threading
+import                  multiprocessing
+import                  time
+#import select
+import                  struct
+import                  json
+import                  random
+from unittest import case
+import                  uuid
+from pathlib     import Path
+from enum        import Enum
+from typing      import Optional, Tuple, List, Dict, Union
 from dataclasses import dataclass
-import signal
-import traceback
+#import signal
+import                  traceback
+import                  uuid
+from collections import deque
 
 
 class ParallelMode(Enum):
@@ -417,10 +416,11 @@ class SequenceSpan:
 class UploadDataSink:
     """Represents an upload data sink for bandwidth testing"""
     
-    def __init__(self, uds_type: UDS_Type, channel: int):
-        """Initialize with type and channel"""
+    def __init__(self, uds_type: UDS_Type, channel: int, duration: int = 30):
+        """Initialize with type, channel, and optional duration"""
         self.uds_type = uds_type
         self.channel = channel
+        self.duration = duration  # Test duration in seconds
         self.created_at = time.time()
         self.sequence_span = None
         self.last_flow_control_sent = 0.0  # Timestamp of last FLOW_CONTROL send
@@ -459,10 +459,12 @@ class ServerConfig:
     server_block_time: int = 100  # milliseconds
     client_block_time: int = 100  # milliseconds
     ucm_delay: int = 100  # milliseconds (upload control message delay)
+    ucm_rate: int = 100  # milliseconds (minimum time between sending upload control messages)
     test_verbose: bool = False  # Print test/debug messages
     bw_packet_length: int = 900  # bytes (bandwidth test packet payload length)
     test_delay: int = 0  # milliseconds (delay in communication loops for testing)
     test_drop_rate: float = 0.0  # probability (0.0-1.0) of dropping packets for testing
+    duration: int = 30  # seconds (bandwidth test duration)
     
     def __post_init__(self):
         if self.port_ranges is None:
@@ -530,17 +532,22 @@ class ServerClientComms:
             'UPLOAD':   {'sum': 0.0, 'count': 0},
             'DOWNLOAD': {'sum': 0.0, 'count': 0},
         }
+
         # Upload control messages dictionary: uid -> UploadControlMessage instance
         self.upload_control_messages: Dict[str, UploadControlMessage] = {}
+
         # Upload data sinks dictionary: channel -> UploadDataSink instance
         self.upload_data_sinks: Dict[int, UploadDataSink] = {}
+
         # Upload bandwidth test start timestamp (None when not in test mode)
         self.upload_bandwidth_started: Optional[float] = None
+
         # Shared state for PROCESS mode (using multiprocessing.Manager)
-        self.shared_manager = None
-        self.shared_ucm_dict = None  # Shared upload control messages
-        self.shared_uds_dict = None  # Shared upload data sinks info
-        self.shared_bw_started = None  # Shared bandwidth test start time
+        #self.shared_manager = None
+        #self.shared_ucm_dict = None  # Shared upload control messages
+        #self.shared_uds_dict = None  # Shared upload data sinks info
+        #self.shared_bw_started = None  # Shared bandwidth test start time
+        self.bw_started = None
         # Client socket addresses (where to send replies)
         self.control_client_addr = None
         self.upload_client_addr = None
@@ -551,6 +558,16 @@ class ServerClientComms:
         self.running = False
         self.port_threads = []  # List of threads for port communication loops
         self.port_processes = []  # List of processes for port communication loops
+
+        self.port_queues   = {}  # Queues for inter-process communication
+        self.return_queues = {}  # Queues for inter-process communication
+        self.processes     = {} 
+        
+        # Track last time upload control messages were sent (for rate limiting)
+        self.last_ucm_send_time = 0.0
+
+        self.duration_from_client = None
+        self.return_queue         = None
         
         # Try to allocate and bind three ports
         if not self._initialize_sockets(port_manager):
@@ -768,21 +785,30 @@ class ServerClientComms:
             if isinstance(json_obj, dict):
                 cmd = json_obj.get('cmd')
                 if cmd == 'BWUP':
+                    if self.test_verbose:
+                        print("BWUP message recvd", file=sys.stderr)
                     # Create UploadControlMessage with ack=0 and the channel from the request
                     channel_from_client = json_obj.get('channel', data_channel)
-                    ucm = UploadControlMessage({'cmd': 'BWUP', 'ack': 0, 'channel': channel_from_client})
+                    duration_from_client = json_obj.get('duration', 30)  # Default to 30 if not specified
+                    ucm = UploadControlMessage({'cmd': 'BWUP', 'ack': 0, 'channel': channel_from_client, 'duration': duration_from_client})
                     uid = ucm.get_uid()
                     
-                    # Store in appropriate dictionary (shared or local)
-                    ucm_dict = self._get_ucm_dict()
-                    if self._use_shared_state():
-                        # Store serialized version in shared dict
-                        ucm_dict[uid] = {
-                            'params': ucm.get_params(),
-                            'last_sent': ucm.last_sent
-                        }
+                    self.upload_control_messages[uid] = ucm
+
+                    if self.server.config.port_parallelability == ParallelMode.PROCESS:
+                        self.duration_from_client = json_obj.get('duration', 30)
+                        self.port_queues[PortType.UPLOAD].put({"cmd":"BWUP", "channel": channel_from_client, "duration": self.duration_from_client})
+                    elif self.server.config.port_parallelability == ParallelMode.SINGLE:
+                        # Directly create UploadDataSink in local dict
+                        self.server.duration_from_client = json_obj.get('duration', 30)
+                        #duration_from_client = json_obj.get('duration', 30)
+                        uds = UploadDataSink(UDS_Type.BANDWIDTH, channel_from_client, self.server.duration_from_client)
+                        self.upload_data_sinks[channel_from_client] = uds   
+                        if self.test_verbose:
+                            print(f"Upload data sink created on channel {channel_from_client}", file=sys.stderr)
                     else:
-                        ucm_dict[uid] = ucm
+                        if self.test_verbose:
+                            printf("THREAD BWUP NOT HANDLED YET", file=sys.stderr)
                     
                     if self.test_verbose:
                         print(f"Server received BWUP packet from {self.client_addr[0]}:{self.client_addr[1]} on channel {channel_from_client}, created UCM {uid}", file=sys.stderr)
@@ -807,40 +833,55 @@ class ServerClientComms:
                             print(f"Server received TEST_RESULT ack from client for guid {guid}, closing connection", file=sys.stderr)
                             sys.stderr.flush()
                         
-                        # Close the connection
-                        self.close()
-                        # Mark this client for removal from server's client_connections
-                        if self.server:
-                            self.server.mark_client_for_removal(self.client_addr)
+                        if self.server.config.port_parallelability == ParallelMode.SINGLE:
+                            # Close the connection
+                            self.close()
+                            # Mark this client for removal from server's client_connections
+                            if self.server:
+                                self.server.mark_client_for_removal(self.client_addr)
+                        elif self.server.config.port_parallelability == ParallelMode.PROCESS:
+                            # In parallel mode, we might handle multiple clients on the same port
+                            # Do not close the connection immediately
+                            msg = {"cmd":"TEST_FINISHED"}
+                            self.return_queue.put(msg)
+                            self.running = False
+                        elif self.server.config.port_parallelability == ParallelMode.THREAD:
+                            # In thread mode, each client might be handled in a separate thread
+                            # Do not close the connection immediately
+                            print("THREAD NOT CODED HERE")
+                            quit()
         
         # Handle BANDWIDTH_TEST messages (upload bandwidth test data)
         if mt == MessageType.BANDWIDTH_TEST and port_type == PortType.UPLOAD:
             # Check if we have an active upload data sink for this channel
-            has_sink = False
-            if self._use_shared_state():
-                has_sink = data_channel in self.shared_uds_dict
-            else:
-                has_sink = data_channel in self.upload_data_sinks
+            #has_sink = False
+            #if self._use_shared_state():
+            #    has_sink = data_channel in self.shared_uds_dict
+            #else:
+
+            has_sink = data_channel in self.upload_data_sinks
             
             if has_sink:
+
                 # Calculate the actual sequence number (channel_sequence_number - sequence_offset)
                 actual_seq_num = channel_sequence_number - sequence_offset
                 
-                if self._use_shared_state():
-                    # Update shared UDS data
-                    uds_data = self.shared_uds_dict[data_channel]
-                    uds_data['bytes_received'] = uds_data.get('bytes_received', 0) + len(data)
-                    uds_data['retransmit_count'] = sequence_offset
-                    uds_data['packet_count'] = uds_data.get('packet_count', 0) + 1
-                    self.shared_uds_dict[data_channel] = uds_data
-                else:
-                    # Update local UDS object
-                    sink = self.upload_data_sinks[data_channel]
-                    if sink.sequence_span:
-                        sink.sequence_span.remove_seq(actual_seq_num)
-                    sink.bytes_received += len(data)
-                    sink.retransmit_count = sequence_offset
-                    sink.packet_count += 1
+                #if self._use_shared_state():
+                #    # Update shared UDS data
+                #    uds_data = self.shared_uds_dict[data_channel]
+                #    uds_data['bytes_received'] = uds_data.get('bytes_received', 0) + len(data)
+                #    uds_data['retransmit_count'] = sequence_offset
+                #    uds_data['packet_count'] = uds_data.get('packet_count', 0) + 1
+                #    self.shared_uds_dict[data_channel] = uds_data
+                #else:
+
+                # Update local UDS object
+                sink = self.upload_data_sinks[data_channel]
+                if sink.sequence_span:
+                    sink.sequence_span.remove_seq(actual_seq_num)
+                sink.bytes_received += len(data)
+                sink.retransmit_count = sequence_offset
+                sink.packet_count += 1
                 
                 if self.test_verbose:
                     if sequence_offset != 0:
@@ -851,61 +892,60 @@ class ServerClientComms:
 
         return True
     
-    def _use_shared_state(self) -> bool:
-        """Check if we should use shared state (PROCESS mode)"""
-        return self.shared_manager is not None
+    #def _use_shared_state(self) -> bool:
+    #    """Check if we should use shared state (PROCESS mode)"""
+    #    return self.shared_manager is not None
     
-    def _get_ucm_dict(self):
-        """Get the appropriate UCM dictionary (shared or local)"""
-        if self._use_shared_state():
-            return self.shared_ucm_dict
-        return self.upload_control_messages
+    #def _get_ucm_dict(self):
+    #    """Get the appropriate UCM dictionary (shared or local)"""
+    #    if self._use_shared_state():
+    #        return self.shared_ucm_dict
+    #    return self.upload_control_messages
     
-    def _get_uds_dict(self):
-        """Get the appropriate UDS dictionary (shared or local)"""
-        if self._use_shared_state():
-            # Need to reconstruct UploadDataSink objects from shared dict
-            # Shared dict stores serializable data, not objects
-            return self._reconstruct_uds_dict()
-        return self.upload_data_sinks
+    #def _get_uds_dict(self):
+    #    """Get the appropriate UDS dictionary (shared or local)"""
+    #    if self._use_shared_state():
+    #        # Need to reconstruct UploadDataSink objects from shared dict
+    #        return self._reconstruct_uds_dict()
+    #    return self.upload_data_sinks
     
-    def _reconstruct_uds_dict(self):
-        """Reconstruct UploadDataSink objects from shared dictionary"""
-        result = {}
-        for channel, uds_data in self.shared_uds_dict.items():
-            # Reconstruct UploadDataSink from serialized data
-            uds = UploadDataSink(UDS_Type.BANDWIDTH, channel)
-            uds.bytes_received = uds_data.get('bytes_received', 0)
-            uds.retransmit_count = uds_data.get('retransmit_count', 0)
-            uds.packet_count = uds_data.get('packet_count', 0)
-            uds.created_at = uds_data.get('created_at', time.time())
-            # Note: sequence_span can't be easily shared, will handle differently
-            result[channel] = uds
-        return result
+    #def _reconstruct_uds_dict(self):
+    #    """Reconstruct UploadDataSink objects from shared dictionary"""
+    #    result = {}
+    #    for channel, uds_data in self.shared_uds_dict.items():
+    #        # Reconstruct UploadDataSink from serialized data
+    #        uds = UploadDataSink(UDS_Type.BANDWIDTH, channel)
+    #        uds.bytes_received = uds_data.get('bytes_received', 0)
+    #        uds.retransmit_count = uds_data.get('retransmit_count', 0)
+    #        uds.packet_count = uds_data.get('packet_count', 0)
+    #        uds.created_at = uds_data.get('created_at', time.time())
+    #        # Note: sequence_span can't be easily shared, will handle differently
+    #        result[channel] = uds
+    #    return result
     
-    def _save_uds_to_shared(self, channel, uds):
-        """Save UploadDataSink data to shared dictionary"""
-        if self._use_shared_state():
-            self.shared_uds_dict[channel] = {
-                'bytes_received': uds.bytes_received,
-                'retransmit_count': uds.retransmit_count,
-                'packet_count': uds.packet_count,
-                'created_at': uds.created_at
-            }
+    #def _save_uds_to_shared(self, channel, uds):
+    #    """Save UploadDataSink data to shared dictionary"""
+    #    if self._use_shared_state():
+    #        self.shared_uds_dict[channel] = {
+    #            'bytes_received': uds.bytes_received,
+    #            'retransmit_count': uds.retransmit_count,
+    #            'packet_count': uds.packet_count,
+    #            'created_at': uds.created_at
+    #        }
     
-    def _get_bw_started(self):
-        """Get bandwidth test start time"""
-        if self._use_shared_state():
-            val = self.shared_bw_started.value
-            return None if val == 0.0 else val
-        return self.upload_bandwidth_started
+    #def _get_bw_started(self):
+    #    """Get bandwidth test start time"""
+    #    if self._use_shared_state():
+    #        val = self.shared_bw_started.value
+    #        return None if val == 0.0 else val
+    #    return self.upload_bandwidth_started
     
-    def _set_bw_started(self, value):
-        """Set bandwidth test start time"""
-        if self._use_shared_state():
-            self.shared_bw_started.value = value if value is not None else 0.0
-        else:
-            self.upload_bandwidth_started = value
+    #def _set_bw_started(self, value):
+    #    """Set bandwidth test start time"""
+    #    if self._use_shared_state():
+    #        self.shared_bw_started.value = value if value is not None else 0.0
+    #    else:
+    #        self.upload_bandwidth_started = value
     
     def send_upload_control_messages(self):
         """Send/resend upload control messages and delete those with ack=0"""
@@ -916,20 +956,20 @@ class ServerClientComms:
         if not self.control_client_addr:
             return  # Don't send if we don't know where to send to
         
-        ucm_dict = self._get_ucm_dict()
+        #ucm_dict = self._get_ucm_dict()
         
         # In PROCESS mode, need to reconstruct UCM objects from shared dict
-        if self._use_shared_state():
-            ucm_items = []
-            for uid, ucm_data in list(ucm_dict.items()):
-                # Reconstruct UploadControlMessage from serialized data
-                ucm = UploadControlMessage(ucm_data['params'])
-                ucm.last_sent = ucm_data.get('last_sent', 0)
-                ucm_items.append((uid, ucm))
-        else:
-            ucm_items = list(ucm_dict.items())
+        #if self._use_shared_state():
+        #    ucm_items = []
+        #    for uid, ucm_data in list(ucm_dict.items()):
+        #        # Reconstruct UploadControlMessage from serialized data
+        #        ucm = UploadControlMessage(ucm_data['params'])
+        #        ucm.last_sent = ucm_data.get('last_sent', 0)
+        #        ucm_items.append((uid, ucm))
+        #else:
+        #    ucm_items = list(ucm_dict.items())
         
-        for uid, ucm in ucm_items:
+        for uid, ucm in self.upload_control_messages.items():
             # Send the message on control port
             try:
                 params = ucm.get_params()
@@ -950,27 +990,30 @@ class ServerClientComms:
                 ucm.last_sent = current_time
                 
                 # Update last_sent in shared dict if using PROCESS mode
-                if self._use_shared_state():
-                    ucm_data = ucm_dict[uid]
-                    ucm_data['last_sent'] = current_time
-                    ucm_dict[uid] = ucm_data
+                #if self._use_shared_state():
+                #    ucm_data = ucm_dict[uid]
+                #    ucm_data['last_sent'] = current_time
+                #    ucm_dict[uid] = ucm_data
                 
                 if self.test_verbose:
                     print(f"Server sent UCM {uid} to {self.control_client_addr[0]}:{self.control_client_addr[1]}: {params}", file=sys.stderr)
                     sys.stderr.flush()
+                    time.sleep(0.2)
                 
                 # Check if this is the first BWUP ack being sent
                 cmd = params.get('cmd')
-                bw_started = self._get_bw_started()
-                if cmd == 'BWUP' and params.get('ack') == 0 and bw_started is None:
+                #bw_started = self._get_bw_started()
+                if cmd == 'BWUP' and params.get('ack') == 0 and self.bw_started is None:
                     # Start upload bandwidth test mode
-                    self._set_bw_started(current_time)
-                    # Create UploadDataSink with BANDWIDTH type and the channel
-                    uds = UploadDataSink(UDS_Type.BANDWIDTH, channel)
-                    if self._use_shared_state():
-                        self._save_uds_to_shared(channel, uds)
-                    else:
-                        self.upload_data_sinks[channel] = uds
+                    self.bw_started = current_time
+                    # Get duration from BWUP params
+                    duration = params.get('duration', 30)
+                    # Create UploadDataSink with BANDWIDTH type, the channel, and duration
+                    self.upload_data_sinks[channel] = UploadDataSink(UDS_Type.BANDWIDTH, channel, duration)
+                    #if self._use_shared_state():
+                    #    self._save_uds_to_shared(channel, uds)
+                    #else:
+                    #    self.upload_data_sinks[channel] = uds
                     if self.test_verbose:
                         print(f"Server started upload bandwidth test on channel {channel}", file=sys.stderr)
                         sys.stderr.flush()
@@ -978,6 +1021,7 @@ class ServerClientComms:
                 # Check if should be deleted (ack=0)
                 if ucm.should_delete():
                     to_delete.append(uid)
+
             except Exception as e:
                 if self.test_verbose:
                     print(f"Error sending UCM {uid}: {e}", file=sys.stderr)
@@ -985,62 +1029,23 @@ class ServerClientComms:
         
         # Delete messages that were sent with ack=0
         for uid in to_delete:
-            del ucm_dict[uid]
+            del self.upload_control_messages[uid]
             if self.test_verbose:
                 print(f"Server deleted UCM {uid} (ack=0)", file=sys.stderr)
                 sys.stderr.flush()
     
-    def check_upload_bandwidth_timeout(self):
-        """Check if upload bandwidth test has timed out (30 seconds) and clean up if needed"""
-        bw_started = self._get_bw_started()
-        if bw_started is not None:
+    def check_upload_bandwidth_timeout(self,duration):
+        """Check if upload bandwidth test has timed out and clean up if needed"""
+        #bw_started = self._get_bw_started()
+        #print(f"check_upload_bandwidth_timeout called self.bw_started={self.bw_started}, duration={duration}, self.duration_from_client={self.duration_from_client}")
+        if self.bw_started is not None:
             current_time = time.time()
-            elapsed = current_time - bw_started
+            elapsed = current_time - self.bw_started
             
-            if elapsed >= 30.0:  # 30 seconds
-                # Get appropriate dictionaries
-                ucm_dict = self._get_ucm_dict()
-                
-                # Calculate statistics and send TEST_RESULT for each sink
-                if self._use_shared_state():
-                    # Process shared UDS data
-                    for channel, uds_data in list(self.shared_uds_dict.items()):
-                        duration = current_time - uds_data.get('created_at', current_time)
-                        bytes_received = uds_data.get('bytes_received', 0)
-                        if duration > 0:
-                            bandwidth_bps = (bytes_received * 8) / duration
-                        else:
-                            bandwidth_bps = 0
-                        
-                        # Create TEST_RESULT UploadControlMessage with statistics
-                        import uuid
-                        guid = str(uuid.uuid4())
-                        params = {
-                            'cmd': 'TEST_RESULT',
-                            'ack': 1,
-                            'guid': guid,
-                            'channel': channel,
-                            'bytes_received': bytes_received,
-                            'bandwidth_bps': bandwidth_bps,
-                            'retransmit_count': uds_data.get('retransmit_count', 0),
-                            'packet_count': uds_data.get('packet_count', 0),
-                            'duration': duration
-                        }
-                        
-                        ucm = UploadControlMessage(params)
-                        uid = ucm.get_uid()
-                        ucm_dict[uid] = {
-                            'params': params,
-                            'last_sent': 0
-                        }
-                        
-                        if self.test_verbose:
-                            print(f"Server created TEST_RESULT for channel {channel}: {bandwidth_bps:.2f} bps, {bytes_received} bytes, {uds_data.get('packet_count', 0)} packets, {uds_data.get('retransmit_count', 0)} retransmits", file=sys.stderr)
-                            sys.stderr.flush()
-                    
-                    # Clear shared UDS dict
-                    self.shared_uds_dict.clear()
-                else:
+            if elapsed >= duration:
+
+                # if in SINGLE mode
+                if self.server.config.port_parallelability == ParallelMode.SINGLE:
                     # Process local UDS objects
                     for channel, sink in list(self.upload_data_sinks.items()):
                         # Calculate upload bandwidth in bits per second
@@ -1051,7 +1056,6 @@ class ServerClientComms:
                             bandwidth_bps = 0
                         
                         # Create TEST_RESULT UploadControlMessage with statistics
-                        import uuid
                         guid = str(uuid.uuid4())
                         params = {
                             'cmd': 'TEST_RESULT',
@@ -1072,17 +1076,39 @@ class ServerClientComms:
                         if self.test_verbose:
                             print(f"Server created TEST_RESULT for channel {channel}: {bandwidth_bps:.2f} bps, {sink.bytes_received} bytes, {sink.packet_count} packets, {sink.retransmit_count} retransmits", file=sys.stderr)
                             sys.stderr.flush()
+                        
+                        # Remove all UploadDataSink instances
+                        channels_to_remove = list(self.upload_data_sinks.keys())
+                        for channel in channels_to_remove:
+                            del self.upload_data_sinks[channel]
+                            if self.test_verbose:
+                                print(f"Server stopped upload bandwidth test on channel {channel} ({duration} second timeout)", file=sys.stderr)
+                                sys.stderr.flush()
                     
-                    # Remove all UploadDataSink instances
-                    channels_to_remove = list(self.upload_data_sinks.keys())
-                    for channel in channels_to_remove:
-                        del self.upload_data_sinks[channel]
-                        if self.test_verbose:
-                            print(f"Server stopped upload bandwidth test on channel {channel} (30 second timeout)", file=sys.stderr)
-                            sys.stderr.flush()
+                    # Exit upload bandwidth test mode
+                    self.bw_started = None
+                elif self.server.config.port_parallelability == ParallelMode.PROCESS:
+                    for channel, sink in list(self.upload_data_sinks.items()):
+                        duration = current_time - sink.created_at
+                        if duration > 0:
+                            bandwidth_bps = (sink.bytes_received * 8) / duration
+                        else:
+                            bandwidth_bps = 0
+                        print(f"Server sending INTERPROCESS TEST_RESULT for channel {channel}: {bandwidth_bps:.2f} bps, {sink.bytes_received} bytes, {sink.packet_count} packets, {sink.retransmit_count} retransmits")    
+                        self.port_queues[PortType.CONTROL].put({
+                                "cmd":"TEST_RESULT", 
+                                "channel": channel, 
+                                "duration": duration,                             
+                                'bytes_received': sink.bytes_received,
+                                'bandwidth_bps': bandwidth_bps,
+                                'retransmit_count': sink.retransmit_count,
+                                'packet_count': sink.packet_count})
+                        self.bw_started = None
+                elif self.server.config.port_parallelability == ParallelMode.THREAD:
+                    raise "THREAD NOT PROGRAMMED"
+                else:
+                    raise ValueError(f"UNKNOWN MODE {self.server.config.port_parallelability}")
                 
-                # Exit upload bandwidth test mode
-                self._set_bw_started(None)
     
     def send_flow_control_messages(self):
         """Send FLOW_CONTROL messages for all active upload data sinks"""
@@ -1090,8 +1116,8 @@ class ServerClientComms:
             return  # Don't send if we don't know where to send to
         
         # FLOW_CONTROL not supported in PROCESS mode (complex sequence_span sharing)
-        if self._use_shared_state():
-            return
+        #if self._use_shared_state():
+        #    return
         
         current_time = time.time()
         
@@ -1135,7 +1161,8 @@ class ServerClientComms:
                         print(f"Error sending FLOW_CONTROL on channel {channel}: {e}", file=sys.stderr)
                         sys.stderr.flush()
     
-    def port_comm_loop(self, port_type: PortType):
+    def port_comm_loop(self, port_type: PortType, port_queue: Optional[multiprocessing.Queue] = None, return_queue: Optional[multiprocessing.Queue] = None):
+        self.return_queue = return_queue
         """Communication loop for a single port - runs in separate thread when port_parallelability=THREAD"""
         # Determine which socket to use
         if port_type == PortType.CONTROL:
@@ -1150,8 +1177,68 @@ class ServerClientComms:
         if not sock:
             return
         
+        time_last_cud = time.time()
+        
         while self.running:
             try:
+                if time.time() - time_last_cud >= 1:
+                    time_last_cud = time.time()
+                    if port_type==PortType.CONTROL:
+                        print("c",end='')
+                    elif port_type==PortType.UPLOAD:
+                        print("u",end='')
+                    elif port_type==PortType.DOWNLOAD:
+                        print("d",end='')
+                    sys.stdout.flush()       
+
+                if self.server.config.port_parallelability==ParallelMode.PROCESS and port_queue and not port_queue.empty():
+                    # Process commands from the main process
+                    if self.test_verbose:
+                        print(f"Process checking for interprocess commands for port {port_type.name}", file=sys.stderr)
+                        sys.stderr.flush()
+                    cmd_data = port_queue.get_nowait()
+                    if cmd_data:
+                        cmd = cmd_data.get("cmd")
+                        if cmd == "STOP":
+                            # Stop command received, clean up and exit gracefully
+                            if self.test_verbose:
+                                print(f"Process received STOP command for port {port_type.name}, cleaning up and exiting", file=sys.stderr)
+                                sys.stderr.flush()
+                            # Clear any active data structures
+                            self.upload_control_messages.clear()
+                            self.upload_data_sinks.clear()
+                            self.running = False
+                            return
+                        elif cmd == "BWUP" and port_type == PortType.UPLOAD:
+                            channel = cmd_data.get("channel", 1)
+                            duration = cmd_data.get("duration", 30)
+                            # Create UploadDataSink with BANDWIDTH type, the channel, and duration
+                            self.upload_data_sinks[channel] = UploadDataSink(UDS_Type.BANDWIDTH, channel, duration)
+                            self.duration_from_client = duration
+                            self.bw_started = time.time()
+
+                            if self.test_verbose:
+                                print(f"Process received BWUP interprocess command for channel {channel} duration {duration}", file=sys.stderr)
+                                sys.stderr.flush()
+                        elif cmd=="TEST_RESULT" and port_type == PortType.CONTROL:
+                            print("GOT TEST_RESULT")
+                            guid = str(uuid.uuid4())
+                            params = {
+                                'cmd':     'TEST_RESULT',
+                                'ack':      1,
+                                'guid':     guid,
+                                'channel':          cmd_data.get("channel",          1),
+                                'bytes_received':   cmd_data.get("bytes_received",   0),
+                                'bandwidth_bps':    cmd_data.get("bandwidth_bps",    0),
+                                'retransmit_count': cmd_data.get("retransmit_count", 0),
+                                'packet_count':     cmd_data.get("packet_count",     0),
+                                'duration':         cmd_data.get("duration",         0)
+                            }
+                            
+                            ucm = UploadControlMessage(params)
+                            uid = ucm.get_uid()
+                            self.upload_control_messages[uid] = ucm
+
                 # Poll socket repeatedly until no more data
                 adata = []
                 while True:
@@ -1162,6 +1249,13 @@ class ServerClientComms:
                         break
                     except socket.timeout:
                         break
+                    except Exception as e:
+                        if self.test_verbose:
+                            print(f"Error receiving data on port {port_type.name}: {e}", file=sys.stderr)
+                            traceback.print_exc(file=sys.stderr)
+                            sys.stderr.flush()
+                        quit()
+
                 
                 if adata:
                     self.handle_client_connection(adata, port_type)
@@ -1170,25 +1264,28 @@ class ServerClientComms:
                 if port_type == PortType.CONTROL:
                     # Send/resend upload control messages if any exist
                     # Check shared dict if in PROCESS mode, otherwise check local dict
-                    has_ucm = False
-                    if self._use_shared_state():
-                        has_ucm = len(self.shared_ucm_dict) > 0
-                    else:
-                        has_ucm = len(self.upload_control_messages) > 0
+                    #has_ucm = False
+                    has_ucm = len(self.upload_control_messages) > 0
                     
                     if has_ucm:
-                        self.send_upload_control_messages()
+                        # Rate limit upload control messages based on ucm_rate config
+                        current_time = time.time()
+                        time_since_last_send = (current_time - self.last_ucm_send_time) * 1000  # convert to ms
+                        if time_since_last_send >= self.server.config.ucm_rate:
+                            self.send_upload_control_messages()
+                            self.last_ucm_send_time = current_time
                     
-                    # Check if upload bandwidth test has timed out
-                    self.check_upload_bandwidth_timeout()
+                if port_type == PortType.UPLOAD:    
+                    # Check if upload bandwidth test has timed out (single mode cubt is called in wyndserver.)
+                    # port_queue does not exist in single mode
+                    if port_queue:
+                        self.check_upload_bandwidth_timeout(self.duration_from_client)
                 
                 elif port_type == PortType.UPLOAD:
                     # Send FLOW_CONTROL messages for active upload data sinks
                     # Check shared dict if in PROCESS mode, otherwise check local dict
                     has_uds = False
-                    if self._use_shared_state():
-                        has_uds = len(self.shared_uds_dict) > 0
-                    else:
+                    if self.upload_data_sinks:
                         has_uds = len(self.upload_data_sinks) > 0
                     
                     if has_uds:
@@ -1205,6 +1302,7 @@ class ServerClientComms:
             except Exception as e:
                 if self.test_verbose:
                     print(f"Error in port_comm_loop for {port_type.name}: {e}", file=sys.stderr)
+                    traceback.print_exc(file=sys.stderr)
                     sys.stderr.flush()
     
     def start_port_threads(self):
@@ -1237,29 +1335,45 @@ class ServerClientComms:
         self.running = True
         
         # Create a multiprocessing Manager for shared state
-        self.shared_manager = multiprocessing.Manager()
-        self.shared_ucm_dict = self.shared_manager.dict()  # Shared UCM dictionary
-        self.shared_uds_dict = self.shared_manager.dict()  # Shared UDS info dictionary
-        self.shared_bw_started = self.shared_manager.Value('d', 0.0)  # Shared bandwidth start time (0.0 = not started)
+        #self.shared_manager = multiprocessing.Manager()
+        #self.shared_ucm_dict = self.shared_manager.dict()  # Shared UCM dictionary
+        #self.shared_uds_dict = self.shared_manager.dict()  # Shared UDS info dictionary
+        #self.shared_bw_started = self.shared_manager.Value('d', 0.0)  # Shared bandwidth start time (0.0 = not started)
         
         # Create and start processes for each port
         for port_type in [PortType.CONTROL, PortType.UPLOAD, PortType.DOWNLOAD]:
-            process = multiprocessing.Process(
+            self.port_queues[port_type]   = multiprocessing.Queue()
+            self.return_queues[port_type] = multiprocessing.Queue()
+            self.processes[port_type] = multiprocessing.Process(
                 target=self.port_comm_loop,
-                args=(port_type,),
+                args=(port_type,self.port_queues[port_type],self.return_queues[port_type]),
                 name=f"Port-{port_type.name}-{self.client_addr[0]}:{self.client_addr[1]}",
                 daemon=True
             )
-            process.start()
+
+        for port_type in [PortType.CONTROL, PortType.UPLOAD, PortType.DOWNLOAD]:
+            process = self.processes[port_type].start()
             self.port_processes.append(process)
     
     def stop_port_processes(self):
         """Stop all port communication processes"""
         self.running = False
         
+        # Send STOP command to all process queues to signal graceful shutdown
+        for port_type, queue in self.port_queues.items():
+            try:
+                queue.put({"cmd": "STOP"}, block=False)
+                print("Sent STOP command to process for port", port_type.name, file=sys.stderr)
+            except:
+                pass  # Queue might be full or closed
+        
+        # Wait for processes to see the STOP command and exit gracefully
+        # Need to wait long enough for processes to complete their current loop iteration
+        time.sleep(1.0)  # Increased to 1 second to ensure processes see the STOP command
+        
         # Terminate processes and wait for them to finish
         for process in self.port_processes:
-            if process.is_alive():
+            if process and process.is_alive():
                 process.terminate()
                 process.join(timeout=1.0)
                 # Force kill if still alive
@@ -1270,12 +1384,12 @@ class ServerClientComms:
         self.port_processes.clear()
         
         # Shutdown the Manager
-        if self.shared_manager is not None:
-            try:
-                self.shared_manager.shutdown()
-            except:
-                pass
-            self.shared_manager = None
+        #if self.shared_manager is not None:
+        #    try:
+        #        self.shared_manager.shutdown()
+        #    except:
+        #        pass
+        #    self.shared_manager = None
     
     def close(self):
         """Close all sockets and stop threads/processes"""
@@ -1306,6 +1420,7 @@ class WyndServer:
         self.main_socket = None
         self.client_connections = {}  # client_addr -> ServerClientComms instance
         self.clients_to_remove = []  # List of client addresses to remove
+        self.duration_from_client = None
 
     def print_latency_summary(self):
         """Print latency summary for all clients"""
@@ -1375,10 +1490,14 @@ class WyndServer:
                             config.client_block_time = int(value)
                         elif key == 'ucm_delay':
                             config.ucm_delay = int(value)
+                        elif key == 'ucm_rate':
+                            config.ucm_rate = int(value)
                         elif key == 'test_verbose':
                             config.test_verbose = value.lower() in ('true', '1', 'yes')
                         elif key == 'bw_packet_length':
                             config.bw_packet_length = int(value)
+                        elif key == 'duration':
+                            config.duration = int(value)
         except Exception as e:
             print(f"Error loading config: {e}", file=sys.stderr)
         
@@ -1580,6 +1699,13 @@ bw_packet_length=900
         """Main server communication loop - handles port assignments and heartbeats"""
         while self.running:
             try:
+                for addr, client_comm in self.client_connections.items():
+                    if client_comm.return_queues:
+                        for port_type, return_queue in client_comm.return_queues.items():
+                            while not return_queue.empty():
+                                msg = return_queue.get()
+                                print(f"received message {msg} from addr {addr} on port {port_type}")
+
                 # Receive incoming packets on main socket
                 data, client_addr = self.main_socket.recvfrom(4096)
                 
@@ -1640,8 +1766,11 @@ bw_packet_length=900
                 pass
             except Exception as e:
                 print(f"Error in server loop: {e}", file=sys.stderr)
+                # print stack trace
+                traceback.print_exc(file=sys.stderr)
             
             # Poll all client sockets for data (only if not in THREAD or PROCESS mode)
+            ### SINGLE ###
             # In THREAD/PROCESS mode, each port has its own thread/process handling communication
             if self.config.port_parallelability not in (ParallelMode.THREAD, ParallelMode.PROCESS):
                 for client_addr, client_comms in list(self.client_connections.items()):
@@ -1689,14 +1818,16 @@ bw_packet_length=900
                     
                     # Send/resend upload control messages if any exist
                     if client_comms.upload_control_messages:
-                        client_comms.send_upload_control_messages()
+                        if time_since_last_send >= self.server.config.ucm_rate:
+                            self.send_upload_control_messages()
+                            self.last_ucm_send_time = current_time
                     
                     # Send FLOW_CONTROL messages for active upload data sinks
                     if client_comms.upload_data_sinks:
                         client_comms.send_flow_control_messages()
                     
                     # Check if upload bandwidth test has timed out
-                    client_comms.check_upload_bandwidth_timeout()
+                    client_comms.check_upload_bandwidth_timeout(self.duration_from_client)
             
             # Remove any clients marked for removal
             for client_addr in self.clients_to_remove:
@@ -1805,7 +1936,7 @@ class WyndClient:
         self.flow_control_rate = 3  # Will be loaded from config if available
         self.bw_packet_length = 900  # bytes (will be loaded from config if available)
         self.bw_test_start_time = None  # Timestamp when bandwidth test started
-        self.bw_test_duration = 30.0  # seconds
+        self.bw_test_duration = 30  # seconds (will be loaded from config if available)
         self.test_result_received = None  # Timestamp when TEST_RESULT was first received
         self.test_result_data = None  # Store TEST_RESULT statistics
         self.test_result_guid = None  # GUID from TEST_RESULT for acking
@@ -1822,7 +1953,6 @@ class WyndClient:
         self.shared_working_sequence_span_data = None  # Shared working sequence span data
         self.shared_flow_control_buffer = None  # Shared flow control buffer
         # Circular buffer for FLOW_CONTROL SequenceSpans
-        from collections import deque
         self.flow_control_buffer = deque(maxlen=self.flow_control_rate)
         self.working_sequence_span = None  # Current working SequenceSpan
         # Generate dummy data for bandwidth test packets
@@ -2627,7 +2757,7 @@ class WyndClient:
         if elapsed >= self.bw_test_duration:
             self._set_bw_test_start_time(None)  # End the test
             if self.test_verbose:
-                print(f"Client bandwidth test completed (30 seconds)", file=sys.stderr)
+                print(f"Client bandwidth test completed ========= ({elapsed:.2f} seconds)", file=sys.stderr)
                 sys.stderr.flush()
             return
         
@@ -2746,7 +2876,8 @@ class WyndClient:
         # Create CONTROL message with BWUP command
         json_payload = {
             'cmd': 'BWUP',
-            'channel': channel
+            'channel': channel,
+            'duration': self.bw_test_duration
         }
         
         # Send CONTROL message on control port
@@ -2940,6 +3071,12 @@ def main():
         help='Probability (0.0-1.0) of dropping packets for testing (default: 0.0)'
     )
     parser.add_argument(
+        '--duration',
+        type=int,
+        metavar='seconds',
+        help='Duration of bandwidth test in seconds (default: 30)'
+    )
+    parser.add_argument(
         '--version',
         action='version',
         version=f'wyndrvr {__version__}'
@@ -3016,6 +3153,10 @@ def main():
         if args.test_drop_rate is not None:
             config.test_drop_rate = args.test_drop_rate
         
+        # Set duration if provided
+        if args.duration is not None:
+            config.duration = args.duration
+        
         server.config = config
         
         try:
@@ -3050,7 +3191,17 @@ def main():
             if args.test_drop_rate is None:
                 test_drop_rate = config.test_drop_rate
         
+        # Handle duration from config and command line
+        duration = 30  # default
+        if config and hasattr(config, 'duration'):
+            duration = config.duration
+        if args.duration is not None:
+            duration = args.duration
+        
         client = WyndClient(addr, port, block_time, bwup=args.bwup, test_verbose=args.test_verbose, test_delay=test_delay, test_drop_rate=test_drop_rate, port_parallelability=port_parallelability)
+        
+        # Set duration from config/command line
+        client.bw_test_duration = duration
         # Set heartbeat interval from config if present (milliseconds -> seconds)
         try:
             if config:
